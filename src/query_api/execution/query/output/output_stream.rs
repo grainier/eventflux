@@ -32,6 +32,10 @@ pub struct ReturnStreamAction {
 pub struct DeleteStreamAction {
     pub target_id: String,
     pub on_delete_expression: Expression,
+    /// Optional alias for the target table (e.g., "s" in "DELETE FROM stockTable AS s")
+    pub target_alias: Option<String>,
+    /// Optional alias for the source stream (e.g., "d" in "USING deleteStream AS d")
+    pub source_alias: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)] // Default removed (due to Expression, SetAttribute)
@@ -39,6 +43,10 @@ pub struct UpdateStreamAction {
     pub target_id: String,
     pub on_update_expression: Expression, // This is the 'ON' condition for the update
     pub update_set_clause: Option<UpdateSet>, // This holds the SET assignments
+    /// Optional alias for the target table (e.g., "s" in "UPDATE stockTable AS s")
+    pub target_alias: Option<String>,
+    /// Optional alias for the source stream (e.g., "u" in "FROM updateStream AS u")
+    pub source_alias: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)] // Default removed (due to Expression, SetAttribute)
@@ -46,6 +54,10 @@ pub struct UpdateOrInsertStreamAction {
     pub target_id: String,
     pub on_update_expression: Expression, // This is the 'ON' condition
     pub update_set_clause: Option<UpdateSet>, // This holds the SET assignments
+    /// Optional alias for the target table (e.g., "s" in "UPSERT INTO stockTable AS s")
+    pub target_alias: Option<String>,
+    /// Optional alias for the source stream (from SELECT ... FROM stream AS alias)
+    pub source_alias: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

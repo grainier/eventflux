@@ -84,6 +84,8 @@ impl OnDemandQuery {
         let action = DeleteStreamAction {
             target_id: output_table_id,
             on_delete_expression: on_deleting_expression,
+            target_alias: None, // Programmatic API, no SQL alias
+            source_alias: None,
         };
         self.output_stream = OutputStream::new(
             OutputStreamAction::Delete(action),
@@ -97,6 +99,8 @@ impl OnDemandQuery {
             target_id: output_table_id,
             on_update_expression,
             update_set_clause: None,
+            target_alias: None, // Programmatic API, no SQL alias
+            source_alias: None,
         };
         self.output_stream = OutputStream::new(
             OutputStreamAction::Update(action),
@@ -115,6 +119,8 @@ impl OnDemandQuery {
             target_id: output_table_id,
             on_update_expression,
             update_set_clause: Some(update_set_attributes),
+            target_alias: None, // Programmatic API, no SQL alias
+            source_alias: None,
         };
         self.output_stream = OutputStream::new(
             OutputStreamAction::Update(action),
@@ -133,6 +139,8 @@ impl OnDemandQuery {
             target_id: output_table_id,
             on_update_expression,
             update_set_clause: Some(update_set_attributes),
+            target_alias: None, // Programmatic API, no SQL alias
+            source_alias: None,
         };
         self.output_stream = OutputStream::new(
             OutputStreamAction::UpdateOrInsert(action),

@@ -194,6 +194,7 @@ fn make_ctx_with_manager(
         },
         default_source: "s".to_string(),
         query_name: Box::leak(name.to_string().into_boxed_str()),
+        is_mutation_context: false,
     }
 }
 
@@ -279,6 +280,7 @@ fn test_register_window_factory() {
             stream_positions: std::collections::HashMap::new(),
             default_source: String::new(),
             query_name: "test_query",
+            is_mutation_context: false,
         };
 
     let res = eventflux_rust::core::query::processor::stream::window::create_window_processor(

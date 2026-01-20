@@ -40,6 +40,7 @@ fn empty_ctx(query: &str) -> ExpressionParserContext {
         stream_positions: HashMap::new(),
         default_source: "dummy".to_string(),
         query_name: query,
+        is_mutation_context: false,
     }
 }
 

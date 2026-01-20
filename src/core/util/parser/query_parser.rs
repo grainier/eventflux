@@ -289,6 +289,7 @@ impl QueryParser {
                     },
                     default_source: input_stream_id.clone(),
                     query_name: &query_name,
+                    is_mutation_context: false,
                 };
 
                 for handler in single_in_stream.get_stream_handlers() {
@@ -327,6 +328,15 @@ impl QueryParser {
                     .right_input_stream
                     .get_stream_id_str()
                     .to_string();
+                // Extract aliases for JOIN expressions (e.g., "FROM Stream1 AS a JOIN Stream2 AS b")
+                let left_alias = join_stream
+                    .left_input_stream
+                    .get_stream_reference_id_str()
+                    .map(|s| s.to_string());
+                let right_alias = join_stream
+                    .right_input_stream
+                    .get_stream_reference_id_str()
+                    .map(|s| s.to_string());
                 let left_is_table = table_def_map.contains_key(&left_id);
                 let right_is_table = table_def_map.contains_key(&right_id);
 
@@ -398,6 +408,7 @@ impl QueryParser {
                                     },
                                     default_source: stream_id.clone(),
                                     query_name: &query_name,
+                                    is_mutation_context: false,
                                 },
                             )
                             .map_err(|e| e.to_string())?,
@@ -445,6 +456,7 @@ impl QueryParser {
                         },
                         default_source: stream_id.clone(),
                         query_name: &query_name,
+                        is_mutation_context: false,
                     }
                 } else {
                     let left_junction = stream_junction_map
@@ -465,10 +477,35 @@ impl QueryParser {
                     let mut right_meta = MetaStreamEvent::new_for_single_input(right_def);
                     right_meta.apply_attribute_offset(left_len);
 
+                    let left_meta_arc = Arc::new(left_meta);
+                    let right_meta_arc = Arc::new(right_meta);
+
                     let mut stream_meta_map = HashMap::new();
-                    stream_meta_map.insert(left_id.clone(), Arc::new(left_meta));
-                    stream_meta_map.insert(right_id.clone(), Arc::new(right_meta));
+                    stream_meta_map.insert(left_id.clone(), Arc::clone(&left_meta_arc));
+                    stream_meta_map.insert(right_id.clone(), Arc::clone(&right_meta_arc));
+                    // Add aliases to stream_meta_map so expressions like "a.symbol" resolve correctly
+                    if let Some(ref alias) = left_alias {
+                        stream_meta_map.insert(alias.clone(), Arc::clone(&left_meta_arc));
+                    }
+                    if let Some(ref alias) = right_alias {
+                        stream_meta_map.insert(alias.clone(), Arc::clone(&right_meta_arc));
+                    }
                     let table_meta_map = HashMap::new();
+
+                    // Build stream_positions map with both stream IDs and aliases
+                    let stream_positions = {
+                        let mut m = HashMap::new();
+                        m.insert(left_id.clone(), 0);
+                        m.insert(right_id.clone(), 1);
+                        // Add aliases to stream_positions for expression parsing
+                        if let Some(ref alias) = left_alias {
+                            m.insert(alias.clone(), 0);
+                        }
+                        if let Some(ref alias) = right_alias {
+                            m.insert(alias.clone(), 1);
+                        }
+                        m
+                    };
 
                     let cond_exec = if let Some(expr) = &join_stream.on_compare {
                         Some(
@@ -482,14 +519,10 @@ impl QueryParser {
                                     window_meta_map: HashMap::new(),
                                     aggregation_meta_map: HashMap::new(),
                                     state_meta_map: HashMap::new(),
-                                    stream_positions: {
-                                        let mut m = HashMap::new();
-                                        m.insert(left_id.clone(), 0);
-                                        m.insert(right_id.clone(), 1);
-                                        m
-                                    },
+                                    stream_positions: stream_positions.clone(),
                                     default_source: left_id.clone(),
                                     query_name: &query_name,
+                                    is_mutation_context: false,
                                 },
                             )
                             .map_err(|e| e.to_string())?,
@@ -524,14 +557,10 @@ impl QueryParser {
                         window_meta_map: HashMap::new(),
                         aggregation_meta_map: HashMap::new(),
                         state_meta_map: HashMap::new(),
-                        stream_positions: {
-                            let mut m = HashMap::new();
-                            m.insert(left_id.clone(), 0);
-                            m.insert(right_id.clone(), 1);
-                            m
-                        },
+                        stream_positions,
                         default_source: left_id.clone(),
                         query_name: &query_name,
+                        is_mutation_context: false,
                     }
                 }
             }
@@ -1335,6 +1364,7 @@ impl QueryParser {
                     stream_positions: stream_positions_map,
                     default_source,
                     query_name: &query_name,
+                    is_mutation_context: false,
                 }
 
                 // All ApiInputStream variants are handled above
@@ -1481,11 +1511,107 @@ impl QueryParser {
             }
             crate::query_api::execution::query::output::output_stream::OutputStreamAction::Update(update_action) => {
                 if let Some(table) = eventflux_app_context.get_eventflux_context().get_table(&update_action.target_id) {
+                    // Get table definition to create table metadata for expression parsing
+                    let table_def = table_def_map
+                        .get(&update_action.target_id)
+                        .ok_or_else(|| format!("Table definition '{}' not found", update_action.target_id))?
+                        .clone();
+
+                    // Create MetaStreamEvent for the table
+                    let table_stream_def = Arc::new(
+                        crate::query_api::definition::stream_definition::StreamDefinition {
+                            abstract_definition: table_def.abstract_definition.clone(),
+                            with_config: None,
+                        },
+                    );
+                    let table_meta = MetaStreamEvent::new_for_single_input(table_stream_def);
+
+                    // Create mutation context with both stream and table metadata
+                    let mut mutation_table_meta_map = expr_parser_context.table_meta_map.clone();
+                    let table_meta_arc = Arc::new(table_meta);
+                    mutation_table_meta_map.insert(update_action.target_id.clone(), Arc::clone(&table_meta_arc));
+                    let mut mutation_stream_positions = expr_parser_context.stream_positions.clone();
+                    mutation_stream_positions.insert(update_action.target_id.clone(), 1);
+
+                    // Register target alias if present (e.g., "s" in "UPDATE stockTable AS s")
+                    if let Some(ref target_alias) = update_action.target_alias {
+                        mutation_table_meta_map.insert(target_alias.clone(), Arc::clone(&table_meta_arc));
+                        mutation_stream_positions.insert(target_alias.clone(), 1);
+                    }
+
+                    // Clone stream_meta_map for mutation context, replacing original name with alias if present
+                    let mut mutation_stream_meta_map = HashMap::new();
+
+                    // Register source stream - use alias if present, otherwise use original name
+                    // When aliased, standard SQL requires using the alias, so we replace rather than add
+                    if let Some((original_name, source_meta)) = expr_parser_context.stream_meta_map.iter().next() {
+                        if let Some(ref source_alias) = update_action.source_alias {
+                            // Use alias instead of original name to avoid duplicate entries
+                            mutation_stream_meta_map.insert(source_alias.clone(), Arc::clone(source_meta));
+                            mutation_stream_positions.insert(source_alias.clone(), 0);
+                        } else {
+                            // No alias - use original name
+                            mutation_stream_meta_map.insert(original_name.clone(), Arc::clone(source_meta));
+                        }
+                    }
+
+                    // For UPDATE mutations, default unqualified columns to the target table
+                    // This matches standard SQL semantics where unqualified columns in UPDATE
+                    // statements refer to the target table (e.g., SET price = newPrice means
+                    // SET stockTable.price = updateStream.newPrice)
+                    let mutation_ctx = ExpressionParserContext {
+                        eventflux_app_context: Arc::clone(eventflux_app_context),
+                        eventflux_query_context: Arc::clone(&eventflux_query_context),
+                        stream_meta_map: mutation_stream_meta_map,
+                        table_meta_map: mutation_table_meta_map,
+                        window_meta_map: expr_parser_context.window_meta_map.clone(),
+                        aggregation_meta_map: expr_parser_context.aggregation_meta_map.clone(),
+                        state_meta_map: expr_parser_context.state_meta_map.clone(),
+                        stream_positions: mutation_stream_positions,
+                        default_source: update_action.target_id.clone(),
+                        query_name: &query_name,
+                        is_mutation_context: true,
+                    };
+
+                    // Parse condition expression for stream-triggered update
+                    let condition_executor = parse_expression(&update_action.on_update_expression, &mutation_ctx)
+                        .map_err(|e| format!("Failed to parse UPDATE condition: {}", e))?;
+
+                    // Parse SET clause value expressions and compute column indices
+                    let (set_value_executors, set_column_indices): (Vec<Box<dyn crate::core::executor::expression_executor::ExpressionExecutor>>, Vec<usize>) =
+                        if let Some(ref update_set) = update_action.update_set_clause {
+                            let mut executors = Vec::new();
+                            let mut indices = Vec::new();
+                            let table_attrs = table_def.abstract_definition.get_attribute_list();
+                            for set_attr in &update_set.set_attributes {
+                                let exec = parse_expression(&set_attr.value_to_set, &mutation_ctx)
+                                    .map_err(|e| format!("Failed to parse SET value: {}", e))?;
+                                executors.push(exec);
+
+                                // Look up column index by name
+                                let col_name = set_attr.table_column.get_attribute_name();
+                                if let Some(col_idx) = table_attrs.iter().position(|a| a.get_name() == col_name) {
+                                    indices.push(col_idx);
+                                } else {
+                                    return Err(format!(
+                                        "SET column '{}' not found in table '{}'",
+                                        col_name, update_action.target_id
+                                    ));
+                                }
+                            }
+                            (executors, indices)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+
                     let update_processor = Arc::new(Mutex::new(
-                        crate::core::query::output::UpdateTableProcessor::new(
+                        crate::core::query::output::UpdateTableProcessor::new_with_expression(
                             table,
                             Arc::clone(eventflux_app_context),
                             Arc::clone(&eventflux_query_context),
+                            condition_executor,
+                            set_value_executors,
+                            set_column_indices,
                         ),
                     ));
                     link_processor(update_processor);
@@ -1498,11 +1624,77 @@ impl QueryParser {
             }
             crate::query_api::execution::query::output::output_stream::OutputStreamAction::Delete(delete_action) => {
                 if let Some(table) = eventflux_app_context.get_eventflux_context().get_table(&delete_action.target_id) {
+                    // Get table definition to create table metadata for expression parsing
+                    let table_def = table_def_map
+                        .get(&delete_action.target_id)
+                        .ok_or_else(|| format!("Table definition '{}' not found", delete_action.target_id))?
+                        .clone();
+
+                    // Create MetaStreamEvent for the table
+                    let table_stream_def = Arc::new(
+                        crate::query_api::definition::stream_definition::StreamDefinition {
+                            abstract_definition: table_def.abstract_definition.clone(),
+                            with_config: None,
+                        },
+                    );
+                    let table_meta = MetaStreamEvent::new_for_single_input(table_stream_def);
+
+                    // Create mutation context with both stream and table metadata
+                    let mut mutation_table_meta_map = expr_parser_context.table_meta_map.clone();
+                    let table_meta_arc = Arc::new(table_meta);
+                    mutation_table_meta_map.insert(delete_action.target_id.clone(), Arc::clone(&table_meta_arc));
+                    let mut mutation_stream_positions = expr_parser_context.stream_positions.clone();
+                    mutation_stream_positions.insert(delete_action.target_id.clone(), 1);
+
+                    // Register target alias if present (e.g., "s" in "DELETE FROM stockTable AS s")
+                    if let Some(ref target_alias) = delete_action.target_alias {
+                        mutation_table_meta_map.insert(target_alias.clone(), Arc::clone(&table_meta_arc));
+                        mutation_stream_positions.insert(target_alias.clone(), 1);
+                    }
+
+                    // Clone stream_meta_map for mutation context, replacing original name with alias if present
+                    let mut mutation_stream_meta_map = HashMap::new();
+
+                    // Register source stream - use alias if present, otherwise use original name
+                    // When aliased, standard SQL requires using the alias, so we replace rather than add
+                    if let Some((original_name, source_meta)) = expr_parser_context.stream_meta_map.iter().next() {
+                        if let Some(ref source_alias) = delete_action.source_alias {
+                            // Use alias instead of original name to avoid duplicate entries
+                            mutation_stream_meta_map.insert(source_alias.clone(), Arc::clone(source_meta));
+                            mutation_stream_positions.insert(source_alias.clone(), 0);
+                        } else {
+                            // No alias - use original name
+                            mutation_stream_meta_map.insert(original_name.clone(), Arc::clone(source_meta));
+                        }
+                    }
+
+                    // For DELETE mutations, default unqualified columns to the target table
+                    // This matches standard SQL semantics where unqualified columns in DELETE
+                    // statements refer to the target table
+                    let mutation_ctx = ExpressionParserContext {
+                        eventflux_app_context: Arc::clone(eventflux_app_context),
+                        eventflux_query_context: Arc::clone(&eventflux_query_context),
+                        stream_meta_map: mutation_stream_meta_map,
+                        table_meta_map: mutation_table_meta_map,
+                        window_meta_map: expr_parser_context.window_meta_map.clone(),
+                        aggregation_meta_map: expr_parser_context.aggregation_meta_map.clone(),
+                        state_meta_map: expr_parser_context.state_meta_map.clone(),
+                        stream_positions: mutation_stream_positions,
+                        default_source: delete_action.target_id.clone(),
+                        query_name: &query_name,
+                        is_mutation_context: true,
+                    };
+
+                    // Parse condition expression for stream-triggered delete
+                    let condition_executor = parse_expression(&delete_action.on_delete_expression, &mutation_ctx)
+                        .map_err(|e| format!("Failed to parse DELETE condition: {}", e))?;
+
                     let delete_processor = Arc::new(Mutex::new(
-                        crate::core::query::output::DeleteTableProcessor::new(
+                        crate::core::query::output::DeleteTableProcessor::new_with_expression(
                             table,
                             Arc::clone(eventflux_app_context),
                             Arc::clone(&eventflux_query_context),
+                            condition_executor,
                         ),
                     ));
                     link_processor(delete_processor);
@@ -1513,7 +1705,119 @@ impl QueryParser {
                     ));
                 }
             }
-            _ => return Err(format!("Query '{query_name}': Only INSERT INTO, UPDATE, DELETE outputs supported for now.")),
+            crate::query_api::execution::query::output::output_stream::OutputStreamAction::UpdateOrInsert(upsert_action) => {
+                if let Some(table) = eventflux_app_context.get_eventflux_context().get_table(&upsert_action.target_id) {
+                    // Get table definition to create table metadata for expression parsing
+                    let table_def = table_def_map
+                        .get(&upsert_action.target_id)
+                        .ok_or_else(|| format!("Table definition '{}' not found", upsert_action.target_id))?
+                        .clone();
+
+                    // Create MetaStreamEvent for the table
+                    let table_stream_def = Arc::new(
+                        crate::query_api::definition::stream_definition::StreamDefinition {
+                            abstract_definition: table_def.abstract_definition.clone(),
+                            with_config: None,
+                        },
+                    );
+                    let table_meta = MetaStreamEvent::new_for_single_input(table_stream_def);
+
+                    // Create mutation context with both stream and table metadata
+                    let mut mutation_table_meta_map = expr_parser_context.table_meta_map.clone();
+                    let table_meta_arc = Arc::new(table_meta);
+                    mutation_table_meta_map.insert(upsert_action.target_id.clone(), Arc::clone(&table_meta_arc));
+                    let mut mutation_stream_positions = expr_parser_context.stream_positions.clone();
+                    mutation_stream_positions.insert(upsert_action.target_id.clone(), 1);
+
+                    // Register target alias if present (future support for "UPSERT INTO table AS t")
+                    if let Some(ref target_alias) = upsert_action.target_alias {
+                        mutation_table_meta_map.insert(target_alias.clone(), Arc::clone(&table_meta_arc));
+                        mutation_stream_positions.insert(target_alias.clone(), 1);
+                    }
+
+                    // Clone stream_meta_map for mutation context, replacing original name with alias if present
+                    let mut mutation_stream_meta_map = HashMap::new();
+
+                    // Register source stream - use alias if present, otherwise use original name
+                    // When aliased, standard SQL requires using the alias, so we replace rather than add
+                    if let Some((original_name, source_meta)) = expr_parser_context.stream_meta_map.iter().next() {
+                        if let Some(ref source_alias) = upsert_action.source_alias {
+                            // Use alias instead of original name to avoid duplicate entries
+                            mutation_stream_meta_map.insert(source_alias.clone(), Arc::clone(source_meta));
+                            mutation_stream_positions.insert(source_alias.clone(), 0);
+                        } else {
+                            // No alias - use original name
+                            mutation_stream_meta_map.insert(original_name.clone(), Arc::clone(source_meta));
+                        }
+                    }
+
+                    // For UPSERT mutations, default unqualified columns to the target table
+                    // This matches standard SQL semantics where unqualified columns in UPSERT
+                    // statements refer to the target table
+                    let mutation_ctx = ExpressionParserContext {
+                        eventflux_app_context: Arc::clone(eventflux_app_context),
+                        eventflux_query_context: Arc::clone(&eventflux_query_context),
+                        stream_meta_map: mutation_stream_meta_map,
+                        table_meta_map: mutation_table_meta_map,
+                        window_meta_map: expr_parser_context.window_meta_map.clone(),
+                        aggregation_meta_map: expr_parser_context.aggregation_meta_map.clone(),
+                        state_meta_map: expr_parser_context.state_meta_map.clone(),
+                        stream_positions: mutation_stream_positions,
+                        default_source: upsert_action.target_id.clone(),
+                        query_name: &query_name,
+                        is_mutation_context: true,
+                    };
+
+                    // Parse ON condition expression for upsert
+                    let condition_executor = parse_expression(&upsert_action.on_update_expression, &mutation_ctx)
+                        .map_err(|e| format!("Failed to parse UPSERT ON condition: {}", e))?;
+
+                    // Parse SET clause value expressions and compute column indices (if partial update specified)
+                    let (set_value_executors, set_column_indices): (Vec<Box<dyn crate::core::executor::expression_executor::ExpressionExecutor>>, Vec<usize>) =
+                        if let Some(ref update_set) = upsert_action.update_set_clause {
+                            let mut executors = Vec::new();
+                            let mut indices = Vec::new();
+                            let table_attrs = table_def.abstract_definition.get_attribute_list();
+                            for set_attr in &update_set.set_attributes {
+                                let exec = parse_expression(&set_attr.value_to_set, &mutation_ctx)
+                                    .map_err(|e| format!("Failed to parse SET value: {}", e))?;
+                                executors.push(exec);
+
+                                // Look up column index by name
+                                let col_name = set_attr.table_column.get_attribute_name();
+                                if let Some(col_idx) = table_attrs.iter().position(|a| a.get_name() == col_name) {
+                                    indices.push(col_idx);
+                                } else {
+                                    return Err(format!(
+                                        "SET column '{}' not found in table '{}'",
+                                        col_name, upsert_action.target_id
+                                    ));
+                                }
+                            }
+                            (executors, indices)
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+
+                    let upsert_processor = Arc::new(Mutex::new(
+                        crate::core::query::output::UpsertTableProcessor::new(
+                            table,
+                            Arc::clone(eventflux_app_context),
+                            Arc::clone(&eventflux_query_context),
+                            condition_executor,
+                            set_value_executors,
+                            set_column_indices,
+                        ),
+                    ));
+                    link_processor(upsert_processor);
+                } else {
+                    return Err(format!(
+                        "Upsert target '{}' not found for query '{}'",
+                        upsert_action.target_id, query_name
+                    ));
+                }
+            }
+            _ => return Err(format!("Query '{query_name}': Only INSERT INTO, UPDATE, DELETE, UPSERT outputs supported for now.")),
         }
 
         // For N-element patterns, connect the terminal's output to the processor chain head

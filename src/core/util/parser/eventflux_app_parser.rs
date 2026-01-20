@@ -291,6 +291,7 @@ impl EventFluxAppParser {
                         stream_positions: std::collections::HashMap::new(),
                         default_source: String::new(),
                         query_name: &format!("__window_{window_id}"),
+                        is_mutation_context: false,
                     };
                 if let Ok(proc) =
                     crate::core::query::processor::stream::window::create_window_processor(

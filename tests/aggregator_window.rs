@@ -49,6 +49,7 @@ fn make_ctx(name: &str) -> ExpressionParserContext<'static> {
         },
         default_source: "s".to_string(),
         query_name: qn,
+        is_mutation_context: false,
     }
 }
 

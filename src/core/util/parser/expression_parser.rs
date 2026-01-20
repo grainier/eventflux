@@ -177,6 +177,10 @@ pub struct ExpressionParserContext<'a> {
     pub stream_positions: HashMap<String, i32>,
     pub default_source: String,
     pub query_name: &'a str,
+    /// When true, indicates this is a mutation context (UPDATE/DELETE/UPSERT)
+    /// where unqualified columns should resolve to the target table without
+    /// raising ambiguity errors even if the column exists in the source stream.
+    pub is_mutation_context: bool,
 }
 
 /// Parses query_api::Expression into core::ExpressionExecutor instances.
@@ -255,11 +259,88 @@ pub fn parse_expression<'a>(
                     }
                 }
             } else {
-                for (id, meta) in &context.stream_meta_map {
-                    check_meta(id, meta)?;
+                // For unqualified columns, check default_source first, but still verify
+                // the column isn't ambiguous (exists in multiple sources)
+                let default_id = &context.default_source;
+                let mut found_in_default = false;
+                let mut also_found_elsewhere = false;
+
+                // First pass: check if column exists in default_source
+                if !default_id.is_empty() {
+                    if let Some(meta) = context.stream_meta_map.get(default_id) {
+                        if meta.find_attribute_info(attribute_name).is_some() {
+                            found_in_default = true;
+                        }
+                    }
+                    if !found_in_default {
+                        if let Some(meta) = context.table_meta_map.get(default_id) {
+                            if meta.find_attribute_info(attribute_name).is_some() {
+                                found_in_default = true;
+                            }
+                        }
+                    }
                 }
-                for (id, meta) in &context.table_meta_map {
-                    check_meta(id, meta)?;
+
+                // Second pass: check if column also exists in OTHER sources (ambiguity check)
+                if found_in_default {
+                    for (id, meta) in &context.stream_meta_map {
+                        if id != default_id && meta.find_attribute_info(attribute_name).is_some() {
+                            also_found_elsewhere = true;
+                            break;
+                        }
+                    }
+                    if !also_found_elsewhere {
+                        for (id, meta) in &context.table_meta_map {
+                            if id != default_id
+                                && meta.find_attribute_info(attribute_name).is_some()
+                            {
+                                also_found_elsewhere = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // If found in default_source AND elsewhere, raise ambiguity error
+                // (unless this is a mutation context where table is intentionally the default)
+                if found_in_default && also_found_elsewhere {
+                    // In mutation contexts (UPDATE/DELETE/UPSERT), default_source is the target table.
+                    // Unqualified columns should resolve to the table without ambiguity error.
+                    if !context.is_mutation_context {
+                        return Err(ExpressionParseError::new(
+                            format!("Attribute '{attribute_name}' found in multiple sources"),
+                            &api_var.eventflux_element,
+                            context.query_name,
+                        ));
+                    }
+                    // Log warning for debugging: ambiguity silently resolved to table column
+                    // This helps users identify when they might have intended the stream column
+                    log::debug!(
+                        "Mutation context: ambiguous column '{}' resolved to table '{}'. \
+                         Use explicit qualifier (e.g., '{}.{}') if stream column was intended.",
+                        attribute_name,
+                        default_id,
+                        default_id,
+                        attribute_name
+                    );
+                }
+
+                // Now actually resolve the column
+                if found_in_default {
+                    // Bind to default_source
+                    if let Some(meta) = context.stream_meta_map.get(default_id) {
+                        check_meta(default_id, meta)?;
+                    } else if let Some(meta) = context.table_meta_map.get(default_id) {
+                        check_meta(default_id, meta)?;
+                    }
+                } else {
+                    // Not in default_source, search all sources (will error if ambiguous)
+                    for (id, meta) in &context.stream_meta_map {
+                        check_meta(id, meta)?;
+                    }
+                    for (id, meta) in &context.table_meta_map {
+                        check_meta(id, meta)?;
+                    }
                 }
                 for (id, meta) in &context.window_meta_map {
                     check_meta(id, meta)?;

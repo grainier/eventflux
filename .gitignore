@@ -146,3 +146,9 @@ website/build/
 website/.cache-loader/
 website/.npm/
 research/
+
+# LLM instruction files
+GEMINI.md
+CLAUDE.md
+AGENTS.md
+/.gemini/

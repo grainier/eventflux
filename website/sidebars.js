@@ -39,6 +39,7 @@ const sidebars = {
         'sql-reference/windows',
         'sql-reference/aggregations',
         'sql-reference/joins',
+        'sql-reference/tables',
         'sql-reference/patterns',
         'sql-reference/functions',
         'sql-reference/triggers',

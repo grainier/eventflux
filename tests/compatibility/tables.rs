@@ -152,22 +152,23 @@ async fn trigger_test2_start() {
 // Reference: query/table/UpdateTableTestCase.java, DeleteFromTableTestCase.java
 // ============================================================================
 
-/// Table update test
-/// Reference: UpdateTableTestCase.java:updateTableTest1
+/// Table update test - verify lookup works without UPDATE first
 #[tokio::test]
-#[ignore = "UPDATE TABLE syntax not yet supported"]
-async fn table_test2_update() {
+async fn table_test2a_lookup_without_update() {
     let app = "\
-        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
         CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
-        CREATE STREAM updateStream (symbol STRING, newPrice FLOAT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
         \n\
         INSERT INTO stockTable SELECT * FROM stockStream;\n\
         \n\
-        UPDATE stockTable SET price = updateStream.newPrice\n\
-        FROM updateStream\n\
-        WHERE stockTable.symbol = updateStream.symbol;\n";
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price, stockTable.volume AS volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
     let runner = AppRunner::new(app, "outputStream").await;
+    // Insert initial data
     runner.send(
         "stockStream",
         vec![
@@ -176,7 +177,54 @@ async fn table_test2_update() {
             AttributeValue::Int(100),
         ],
     );
-    sleep(Duration::from_millis(50));
+    sleep(Duration::from_millis(100));
+    // Lookup without update
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(100));
+    let out = runner.shutdown();
+    // Table should return original values
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(out[0][1], AttributeValue::Float(100.0)); // Original price
+    assert_eq!(out[0][2], AttributeValue::Int(100));
+}
+
+/// Table update test
+/// Reference: UpdateTableTestCase.java:updateTableTest1
+#[tokio::test]
+async fn table_test2_update() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE STREAM updateStream (symbol STRING, newPrice FLOAT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.newPrice\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price, stockTable.volume AS volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+    // Insert initial data
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+            AttributeValue::Int(100),
+        ],
+    );
+    sleep(Duration::from_millis(100));
+    // Update the price
     runner.send(
         "updateStream",
         vec![
@@ -184,27 +232,44 @@ async fn table_test2_update() {
             AttributeValue::Float(150.0),
         ],
     );
+    sleep(Duration::from_millis(100));
+    // Lookup to verify the update
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(100));
     let out = runner.shutdown();
-    // Table should be updated
-    assert!(!out.is_empty());
+    // Table should have updated price
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(out[0][1], AttributeValue::Float(150.0)); // Updated price
+    assert_eq!(out[0][2], AttributeValue::Int(100));
 }
 
 /// Table delete test
 /// Reference: DeleteFromTableTestCase.java:deleteFromTableTest1
 #[tokio::test]
-#[ignore = "DELETE FROM TABLE syntax not yet supported"]
 async fn table_test3_delete() {
     let app = "\
-        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
         CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
         CREATE STREAM deleteStream (symbol STRING);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
         \n\
         INSERT INTO stockTable SELECT * FROM stockStream;\n\
         \n\
         DELETE FROM stockTable\n\
-        FROM deleteStream\n\
-        WHERE stockTable.symbol = deleteStream.symbol;\n";
+        USING deleteStream\n\
+        WHERE stockTable.symbol = deleteStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price, stockTable.volume AS volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
     let runner = AppRunner::new(app, "outputStream").await;
+    // Insert initial data
     runner.send(
         "stockStream",
         vec![
@@ -214,12 +279,19 @@ async fn table_test3_delete() {
         ],
     );
     sleep(Duration::from_millis(50));
+    // Delete the row
     runner.send(
         "deleteStream",
         vec![AttributeValue::String("IBM".to_string())],
     );
+    sleep(Duration::from_millis(50));
+    // Lookup to verify the delete - should find nothing
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
     let out = runner.shutdown();
-    // Row should be deleted
+    // Row should be deleted - lookup returns empty
     assert!(out.is_empty());
 }
 
@@ -376,17 +448,24 @@ async fn table_test6_with_aggregation() {
 /// Test update or insert into table
 /// Reference: UpdateOrInsertTableTestCase.java:updateOrInsertTableTest1
 #[tokio::test]
-#[ignore = "UPDATE OR INSERT syntax not yet supported"]
 async fn table_test7_upsert() {
     let app = "\
-        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
         CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
         \n\
-        UPDATE OR INSERT INTO stockTable\n\
+        UPSERT INTO stockTable\n\
         SELECT symbol, price, volume\n\
         FROM stockStream\n\
-        ON stockTable.symbol = stockStream.symbol;\n";
+        ON stockTable.symbol = stockStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price, stockTable.volume AS volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
     let runner = AppRunner::new(app, "outputStream").await;
+    // First insert - should insert new row
     runner.send(
         "stockStream",
         vec![
@@ -395,7 +474,8 @@ async fn table_test7_upsert() {
             AttributeValue::Int(100),
         ],
     );
-    // Upsert should update existing or insert new
+    sleep(Duration::from_millis(50));
+    // Second upsert - should update existing row
     runner.send(
         "stockStream",
         vec![
@@ -404,8 +484,1024 @@ async fn table_test7_upsert() {
             AttributeValue::Int(200),
         ],
     );
+    sleep(Duration::from_millis(50));
+    // Lookup to verify upsert
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
     let out = runner.shutdown();
-    assert!(!out.is_empty());
+    // Should have exactly one row with updated values
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(out[0][1], AttributeValue::Float(150.0)); // Updated price
+    assert_eq!(out[0][2], AttributeValue::Int(200)); // Updated volume
+}
+
+// ============================================================================
+// COMPREHENSIVE MUTATION TESTS - EDGE CASES
+// ============================================================================
+
+/// UPDATE with no matching rows - should not affect table
+#[tokio::test]
+async fn table_mutation_update_no_match() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE STREAM updateStream (symbol STRING, newPrice FLOAT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.newPrice\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price, stockTable.volume AS volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert IBM
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+            AttributeValue::Int(100),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Try to update AAPL (doesn't exist) - should have no effect
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Float(999.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Lookup IBM - should still have original values
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1, "IBM should still exist");
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Float(100.0),
+        "Price should be unchanged"
+    );
+    assert_eq!(out[0][2], AttributeValue::Int(100));
+}
+
+/// UPDATE multiple rows matching same condition
+#[tokio::test]
+async fn table_mutation_update_multiple_rows() {
+    let app = "\
+        CREATE TABLE stockTable (category STRING, symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (category STRING, symbol STRING, price FLOAT);\n\
+        CREATE STREAM updateStream (category STRING, newPrice FLOAT);\n\
+        CREATE STREAM lookupStream (category STRING);\n\
+        CREATE STREAM outputStream (category STRING, symbol STRING, price FLOAT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.newPrice\n\
+        FROM updateStream\n\
+        WHERE stockTable.category = updateStream.category;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.category, stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.category = stockTable.category;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert multiple tech stocks
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("TECH".to_string()),
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("TECH".to_string()),
+            AttributeValue::String("MSFT".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Update all TECH stocks to same price
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("TECH".to_string()),
+            AttributeValue::Float(500.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Lookup TECH category - should find both with updated price
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("TECH".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 2, "Both TECH stocks should be returned");
+    // Both should have updated price
+    for row in &out {
+        assert_eq!(row[0], AttributeValue::String("TECH".to_string()));
+        assert_eq!(
+            row[2],
+            AttributeValue::Float(500.0),
+            "Price should be updated to 500.0"
+        );
+    }
+}
+
+/// UPDATE with multiple SET columns
+#[tokio::test]
+async fn table_mutation_update_multiple_columns() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE STREAM updateStream (symbol STRING, newPrice FLOAT, newVolume INT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.newPrice, volume = updateStream.newVolume\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price, stockTable.volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert initial data
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+            AttributeValue::Int(1000),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Update both price and volume
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(150.0),
+            AttributeValue::Int(2000),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify both columns updated
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Float(150.0),
+        "Price should be updated"
+    );
+    assert_eq!(
+        out[0][2],
+        AttributeValue::Int(2000),
+        "Volume should be updated"
+    );
+}
+
+/// DELETE with no matching rows - should not affect table
+#[tokio::test]
+async fn table_mutation_delete_no_match() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE STREAM deleteStream (symbol STRING);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        DELETE FROM stockTable\n\
+        USING deleteStream\n\
+        WHERE stockTable.symbol = deleteStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price, stockTable.volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert IBM
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+            AttributeValue::Int(100),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Try to delete AAPL (doesn't exist) - should have no effect
+    runner.send(
+        "deleteStream",
+        vec![AttributeValue::String("AAPL".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Lookup IBM - should still exist
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1, "IBM should still exist after failed delete");
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+}
+
+/// DELETE multiple rows matching same condition
+#[tokio::test]
+async fn table_mutation_delete_multiple_rows() {
+    let app = "\
+        CREATE TABLE stockTable (category STRING, symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (category STRING, symbol STRING, price FLOAT);\n\
+        CREATE STREAM deleteStream (category STRING);\n\
+        CREATE STREAM lookupStream (category STRING);\n\
+        CREATE STREAM outputStream (category STRING, symbol STRING, price FLOAT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        DELETE FROM stockTable\n\
+        USING deleteStream\n\
+        WHERE stockTable.category = deleteStream.category;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.category, stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.category = stockTable.category;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert TECH stocks
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("TECH".to_string()),
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("TECH".to_string()),
+            AttributeValue::String("MSFT".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    // Insert FINANCE stock
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("FINANCE".to_string()),
+            AttributeValue::String("JPM".to_string()),
+            AttributeValue::Float(150.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Delete all TECH stocks
+    runner.send(
+        "deleteStream",
+        vec![AttributeValue::String("TECH".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Lookup TECH - should find nothing
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("TECH".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert!(out.is_empty(), "All TECH stocks should be deleted");
+}
+
+/// DELETE preserves non-matching rows
+#[tokio::test]
+async fn table_mutation_delete_preserves_others() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
+        CREATE STREAM deleteStream (symbol STRING);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        DELETE FROM stockTable\n\
+        USING deleteStream\n\
+        WHERE stockTable.symbol = deleteStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert two stocks
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Delete only IBM
+    runner.send(
+        "deleteStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify AAPL still exists
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("AAPL".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1, "AAPL should still exist");
+    assert_eq!(out[0][0], AttributeValue::String("AAPL".to_string()));
+    assert_eq!(out[0][1], AttributeValue::Float(200.0));
+}
+
+/// UPSERT pure insert - first event with no existing match
+#[tokio::test]
+async fn table_mutation_upsert_pure_insert() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT, volume INT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT, volume INT);\n\
+        \n\
+        UPSERT INTO stockTable\n\
+        SELECT symbol, price, volume\n\
+        FROM stockStream\n\
+        ON stockTable.symbol = stockStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price, stockTable.volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // UPSERT into empty table - should insert
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+            AttributeValue::Int(1000),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify the insert
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1, "Row should be inserted");
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(out[0][1], AttributeValue::Float(100.0));
+    assert_eq!(out[0][2], AttributeValue::Int(1000));
+}
+
+/// UPSERT multiple distinct inserts
+#[tokio::test]
+async fn table_mutation_upsert_multiple_inserts() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT);\n\
+        \n\
+        UPSERT INTO stockTable\n\
+        SELECT symbol, price\n\
+        FROM stockStream\n\
+        ON stockTable.symbol = stockStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert three different stocks
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("MSFT".to_string()),
+            AttributeValue::Float(300.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify all three exist
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("AAPL".to_string())],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("MSFT".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 3, "All three stocks should exist");
+}
+
+/// UPSERT alternating insert and update
+#[tokio::test]
+async fn table_mutation_upsert_alternating() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT);\n\
+        \n\
+        UPSERT INTO stockTable\n\
+        SELECT symbol, price\n\
+        FROM stockStream\n\
+        ON stockTable.symbol = stockStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert IBM
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Insert AAPL (new)
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Update IBM (existing)
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(150.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Insert MSFT (new)
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("MSFT".to_string()),
+            AttributeValue::Float(300.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Lookup IBM - should have updated value
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Float(150.0),
+        "IBM should have updated price"
+    );
+}
+
+/// Interleaved mutations - INSERT, UPDATE, DELETE sequence
+#[tokio::test]
+async fn table_mutation_interleaved_operations() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM insertStream (symbol STRING, price FLOAT);\n\
+        CREATE STREAM updateStream (symbol STRING, newPrice FLOAT);\n\
+        CREATE STREAM deleteStream (symbol STRING);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM insertStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.newPrice\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        DELETE FROM stockTable\n\
+        USING deleteStream\n\
+        WHERE stockTable.symbol = deleteStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert IBM
+    runner.send(
+        "insertStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Insert AAPL
+    runner.send(
+        "insertStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Update IBM
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(150.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Delete AAPL
+    runner.send(
+        "deleteStream",
+        vec![AttributeValue::String("AAPL".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Lookup IBM - should exist with updated price
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(30));
+
+    // Lookup AAPL - should not exist
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("AAPL".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1, "Only IBM should exist");
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Float(150.0),
+        "IBM should have updated price"
+    );
+}
+
+/// UPDATE preserves non-matching rows
+#[tokio::test]
+async fn table_mutation_update_preserves_others() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price FLOAT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
+        CREATE STREAM updateStream (symbol STRING, newPrice FLOAT);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price FLOAT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.newPrice\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert two stocks
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(30));
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Update only IBM
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(150.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify AAPL is unchanged
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("AAPL".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("AAPL".to_string()));
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Float(200.0),
+        "AAPL should be unchanged"
+    );
+}
+
+/// UPDATE with expression in SET clause (arithmetic)
+#[tokio::test]
+async fn table_mutation_update_with_expression() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price DOUBLE) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price DOUBLE);\n\
+        CREATE STREAM updateStream (symbol STRING, multiplier DOUBLE);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price DOUBLE);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = updateStream.multiplier * 100.0\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol, stockTable.price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert IBM
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Double(100.0),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Update with expression: price = 1.5 * 100.0 = 150.0
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Double(1.5),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify the expression was evaluated
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Double(150.0),
+        "Price should be multiplier * 100.0"
+    );
+}
+
+/// UPSERT with different data types
+#[tokio::test]
+async fn table_mutation_upsert_different_types() {
+    let app = "\
+        CREATE TABLE dataTable (id INT, name STRING, value DOUBLE, active BOOL) WITH (extension = 'inMemory');\n\
+        CREATE STREAM dataStream (id INT, name STRING, value DOUBLE, active BOOL);\n\
+        CREATE STREAM lookupStream (id INT);\n\
+        CREATE STREAM outputStream (id INT, name STRING, value DOUBLE, active BOOL);\n\
+        \n\
+        UPSERT INTO dataTable\n\
+        SELECT id, name, value, active\n\
+        FROM dataStream\n\
+        ON dataTable.id = dataStream.id;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT dataTable.id, dataTable.name, dataTable.value, dataTable.active\n\
+        FROM lookupStream JOIN dataTable\n\
+        ON lookupStream.id = dataTable.id;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert with various types
+    runner.send(
+        "dataStream",
+        vec![
+            AttributeValue::Int(1),
+            AttributeValue::String("test".to_string()),
+            AttributeValue::Double(3.14159),
+            AttributeValue::Bool(true),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Update with different values
+    runner.send(
+        "dataStream",
+        vec![
+            AttributeValue::Int(1),
+            AttributeValue::String("updated".to_string()),
+            AttributeValue::Double(2.71828),
+            AttributeValue::Bool(false),
+        ],
+    );
+    sleep(Duration::from_millis(50));
+
+    // Verify updated values
+    runner.send("lookupStream", vec![AttributeValue::Int(1)]);
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::Int(1));
+    assert_eq!(out[0][1], AttributeValue::String("updated".to_string()));
+    assert_eq!(out[0][2], AttributeValue::Double(2.71828));
+    assert_eq!(out[0][3], AttributeValue::Bool(false));
+}
+
+/// UPDATE with SET expression referencing BOTH table and stream columns
+/// This tests that SET expressions are evaluated per-row with proper table context
+#[tokio::test]
+async fn table_mutation_update_set_references_table_column() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price DOUBLE, volume INT) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price DOUBLE, volume INT);\n\
+        CREATE STREAM updateStream (symbol STRING, delta DOUBLE);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price DOUBLE, volume INT);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = stockTable.price + updateStream.delta\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol = updateStream.symbol;\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price, stockTable.volume AS volume\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert IBM at price 100.0 and AAPL at price 200.0
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Double(100.0),
+            AttributeValue::Int(1000),
+        ],
+    );
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("AAPL".to_string()),
+            AttributeValue::Double(200.0),
+            AttributeValue::Int(2000),
+        ],
+    );
+    sleep(Duration::from_millis(100));
+
+    // Update IBM: price = stockTable.price + delta = 100.0 + 25.0 = 125.0
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Double(25.0),
+        ],
+    );
+    sleep(Duration::from_millis(100));
+
+    // Lookup IBM - should have updated price
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("IBM".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], AttributeValue::String("IBM".to_string()));
+    // The key assertion: price should be 100.0 + 25.0 = 125.0
+    // NOT just 25.0 (if table column was ignored) or some other wrong value
+    assert_eq!(
+        out[0][1],
+        AttributeValue::Double(125.0),
+        "SET price = stockTable.price + updateStream.delta should compute 100.0 + 25.0 = 125.0"
+    );
+    assert_eq!(out[0][2], AttributeValue::Int(1000));
+}
+
+/// UPDATE with SET expression referencing table columns - multiple rows with different values
+/// Verifies each row gets its own computed value, not the same value for all
+#[tokio::test]
+async fn table_mutation_update_set_per_row_evaluation() {
+    let app = "\
+        CREATE TABLE stockTable (symbol STRING, price DOUBLE) WITH (extension = 'inMemory');\n\
+        CREATE STREAM stockStream (symbol STRING, price DOUBLE);\n\
+        CREATE STREAM updateStream (category STRING, multiplier DOUBLE);\n\
+        CREATE STREAM lookupStream (symbol STRING);\n\
+        CREATE STREAM outputStream (symbol STRING, price DOUBLE);\n\
+        \n\
+        INSERT INTO stockTable SELECT * FROM stockStream;\n\
+        \n\
+        UPDATE stockTable SET price = stockTable.price * updateStream.multiplier\n\
+        FROM updateStream\n\
+        WHERE stockTable.symbol LIKE 'TECH%';\n\
+        \n\
+        INSERT INTO outputStream\n\
+        SELECT stockTable.symbol AS symbol, stockTable.price AS price\n\
+        FROM lookupStream JOIN stockTable\n\
+        ON lookupStream.symbol = stockTable.symbol;\n";
+    let runner = AppRunner::new(app, "outputStream").await;
+
+    // Insert two TECH stocks with different prices
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("TECH1".to_string()),
+            AttributeValue::Double(100.0),
+        ],
+    );
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("TECH2".to_string()),
+            AttributeValue::Double(50.0),
+        ],
+    );
+    sleep(Duration::from_millis(100));
+
+    // Update all TECH stocks: multiply each by 2.0
+    // TECH1: 100.0 * 2.0 = 200.0
+    // TECH2: 50.0 * 2.0 = 100.0
+    runner.send(
+        "updateStream",
+        vec![
+            AttributeValue::String("TECH".to_string()),
+            AttributeValue::Double(2.0),
+        ],
+    );
+    sleep(Duration::from_millis(100));
+
+    // Lookup both
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("TECH1".to_string())],
+    );
+    runner.send(
+        "lookupStream",
+        vec![AttributeValue::String("TECH2".to_string())],
+    );
+    sleep(Duration::from_millis(50));
+    let out = runner.shutdown();
+
+    assert_eq!(out.len(), 2, "Should have 2 results");
+
+    // Find TECH1 and TECH2 in results
+    let tech1 = out
+        .iter()
+        .find(|r| r[0] == AttributeValue::String("TECH1".to_string()));
+    let tech2 = out
+        .iter()
+        .find(|r| r[0] == AttributeValue::String("TECH2".to_string()));
+
+    assert!(tech1.is_some(), "TECH1 should be in results");
+    assert!(tech2.is_some(), "TECH2 should be in results");
+
+    // Each row should have its own computed value
+    assert_eq!(
+        tech1.unwrap()[1],
+        AttributeValue::Double(200.0),
+        "TECH1: 100.0 * 2.0 = 200.0"
+    );
+    assert_eq!(
+        tech2.unwrap()[1],
+        AttributeValue::Double(100.0),
+        "TECH2: 50.0 * 2.0 = 100.0"
+    );
 }
 
 // ============================================================================

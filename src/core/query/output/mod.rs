@@ -11,7 +11,7 @@ pub mod insert_into_aggregation_processor;
 pub mod insert_into_stream_processor;
 pub mod insert_into_table_processor;
 pub mod update_table_processor;
-// pub mod update_or_insert_stream_processor; // For UPDATE OR INSERT
+pub mod upsert_table_processor;
 // pub mod output_rate_limiter; // Core engine's rate limiter
 pub mod callback_processor; // Added
 
@@ -23,4 +23,5 @@ pub use self::delete_table_processor::DeleteTableProcessor;
 pub use self::insert_into_aggregation_processor::InsertIntoAggregationProcessor;
 pub use self::insert_into_stream_processor::InsertIntoStreamProcessor;
 pub use self::insert_into_table_processor::InsertIntoTableProcessor;
-pub use self::update_table_processor::UpdateTableProcessor; // Added
+pub use self::update_table_processor::UpdateTableProcessor;
+pub use self::upsert_table_processor::UpsertTableProcessor;

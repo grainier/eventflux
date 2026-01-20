@@ -92,6 +92,9 @@ pub enum ConverterError {
 
     #[error("Aggregation '{0}' cannot be used in pattern/sequence. Only streams can be used in PATTERN or SEQUENCE clauses.")]
     AggregationInPattern(String),
+
+    #[error("Schema mismatch: {0}")]
+    SchemaMismatch(String),
 }
 
 #[derive(Debug, Error)]

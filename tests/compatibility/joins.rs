@@ -50,9 +50,7 @@ async fn join_test1_inner_with_window() {
 
 /// Test join with aliases
 /// Reference: JoinTestCase.java:joinTest2
-/// Note: EventFlux doesn't support join aliases yet
 #[tokio::test]
-#[ignore = "Join aliases not yet supported"]
 async fn join_test2_with_aliases() {
     let app = "\
         CREATE STREAM cseEventStream (symbol STRING, price FLOAT, volume INT);\n\
@@ -86,9 +84,7 @@ async fn join_test2_with_aliases() {
 
 /// Test self-join
 /// Reference: JoinTestCase.java:joinTest3
-/// Note: EventFlux doesn't support self-join with aliases yet
 #[tokio::test]
-#[ignore = "Self-join with aliases not yet supported"]
 async fn join_test3_self_join() {
     let app = "\
         CREATE STREAM cseEventStream (symbol STRING, price FLOAT, volume INT);\n\

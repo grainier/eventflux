@@ -105,6 +105,7 @@ fn parser_ctx(manager: &EventFluxManager) -> ExpressionParserContext<'static> {
         stream_positions: HashMap::new(),
         default_source: "default".to_string(),
         query_name: "q",
+        is_mutation_context: false,
     }
 }
 

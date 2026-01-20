@@ -401,20 +401,60 @@ impl SqlApplication {
         }
     }
 
+    /// Extract JOIN aliases from a Query's JoinInputStream
+    ///
+    /// Returns a vector of (alias, stream_id) pairs for JOIN queries.
+    /// For example: `FROM Stream1 AS a JOIN Stream2 AS b` returns [("a", "Stream1"), ("b", "Stream2")]
+    fn extract_join_aliases_from_query(
+        query: &crate::query_api::execution::query::Query,
+    ) -> Vec<(String, String)> {
+        use crate::query_api::execution::query::input::stream::input_stream::InputStream;
+
+        let mut aliases = Vec::new();
+
+        if let Some(InputStream::Join(join)) = query.get_input_stream() {
+            // Extract left stream alias
+            if let Some(ref_id) = join.left_input_stream.get_stream_reference_id_str() {
+                let stream_id = join.left_input_stream.get_stream_id_str().to_string();
+                aliases.push((ref_id.to_string(), stream_id));
+            }
+            // Extract right stream alias
+            if let Some(ref_id) = join.right_input_stream.get_stream_reference_id_str() {
+                let stream_id = join.right_input_stream.get_stream_id_str().to_string();
+                aliases.push((ref_id.to_string(), stream_id));
+            }
+        }
+
+        aliases
+    }
+
     /// Process output streams using type inference (called before moving catalog)
     fn process_output_streams(&mut self, app: &mut EventFluxApp) -> Result<(), ApplicationError> {
         // First, extract and register all pattern aliases from queries
         // This allows type inference to resolve aliased column references like e1.price
+        // Also extract JOIN aliases for queries like "FROM Stream1 AS a JOIN Stream2 AS b"
         for elem in &self.execution_elements {
             if let ExecutionElement::Query(query) = elem {
+                // Extract pattern aliases (e.g., PATTERN (e1=Stream1 -> e2=Stream2))
                 let aliases = Self::extract_pattern_aliases_from_query(query);
                 for (alias, stream_id) in aliases {
                     self.catalog.register_alias(alias, stream_id);
                 }
+                // Extract JOIN aliases (e.g., FROM Stream1 AS a JOIN Stream2 AS b)
+                let join_aliases = Self::extract_join_aliases_from_query(query);
+                for (alias, stream_id) in join_aliases {
+                    self.catalog.register_alias(alias, stream_id);
+                }
             } else if let ExecutionElement::Partition(partition) = elem {
                 for query in &partition.query_list {
+                    // Extract pattern aliases
                     let aliases = Self::extract_pattern_aliases_from_query(query);
                     for (alias, stream_id) in aliases {
+                        self.catalog.register_alias(alias, stream_id);
+                    }
+                    // Extract JOIN aliases
+                    let join_aliases = Self::extract_join_aliases_from_query(query);
+                    for (alias, stream_id) in join_aliases {
                         self.catalog.register_alias(alias, stream_id);
                     }
                 }

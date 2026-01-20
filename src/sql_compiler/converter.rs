@@ -95,6 +95,128 @@ impl SqlConverter {
         Self::convert_query_internal(query, catalog, output_stream_name)
     }
 
+    /// Convert a mutation query (UPDATE or DELETE from stream)
+    ///
+    /// Creates a simple passthrough query from the source stream with the given output action.
+    /// The source stream events trigger the mutation operation on the target table.
+    pub fn convert_mutation_query(
+        source_stream_name: &str,
+        catalog: &SqlCatalog,
+        output_action: OutputStreamAction,
+    ) -> Result<Query, ConverterError> {
+        // Validate source stream exists
+        catalog
+            .get_relation(source_stream_name)
+            .map_err(|_| ConverterError::SchemaNotFound(source_stream_name.to_string()))?;
+
+        // Create input stream from source
+        let single_stream = SingleInputStream::new_basic(
+            source_stream_name.to_string(),
+            false, // is_inner_stream
+            false, // is_fault_stream
+            None,  // stream_handler_id
+            Vec::new(),
+        );
+
+        // Get all attributes from source stream for SELECT *
+        let relation = catalog.get_relation(source_stream_name).unwrap();
+        let attributes = relation.abstract_definition().get_attribute_list();
+
+        // Build selector with all attributes from source stream
+        let mut selector = crate::query_api::execution::query::selection::Selector::new();
+        for attr in attributes {
+            selector = selector.select_variable(Variable::new(attr.get_name().clone()));
+        }
+
+        // Create output stream with the mutation action
+        let output_stream = OutputStream::new(output_action, None);
+
+        // Build Query
+        Ok(Query::query()
+            .from(InputStream::Single(single_stream))
+            .select(selector)
+            .out_stream(output_stream))
+    }
+
+    /// Convert an UPSERT query (SELECT ... FROM stream with UpdateOrInsert output)
+    ///
+    /// Converts a full SELECT query and replaces its output action with the upsert action.
+    /// Note: UPSERT currently only supports simple stream sources (no JOINs or WINDOWs)
+    /// because the runtime processor requires StreamEvent input.
+    pub fn convert_upsert_query(
+        source_query: &sqlparser::ast::Query,
+        catalog: &SqlCatalog,
+        output_action: OutputStreamAction,
+    ) -> Result<Query, ConverterError> {
+        // Validate: UPSERT only supports simple stream sources (no JOINs or WINDOWs)
+        // because UpsertTableProcessor requires StreamEvent input
+        if let SetExpr::Select(select) = source_query.body.as_ref() {
+            // Check for JOINs (multiple FROM tables or explicit JOIN clauses)
+            if select.from.len() > 1 {
+                return Err(ConverterError::UnsupportedFeature(
+                    "UPSERT with multiple source streams not supported".to_string(),
+                ));
+            }
+            if let Some(from) = select.from.first() {
+                if !from.joins.is_empty() {
+                    return Err(ConverterError::UnsupportedFeature(
+                        "UPSERT with JOIN source not supported".to_string(),
+                    ));
+                }
+                // Check for streaming WINDOW on the table factor
+                if let TableFactor::Table {
+                    window: Some(_), ..
+                } = &from.relation
+                {
+                    return Err(ConverterError::UnsupportedFeature(
+                        "UPSERT with WINDOW source not supported".to_string(),
+                    ));
+                }
+            }
+
+            // Schema validation: Check SELECT column count matches target table
+            // This is only validated when there's no SET clause (full row replacement mode)
+            if let OutputStreamAction::UpdateOrInsert(ref upsert_action) = output_action {
+                // Only validate when no SET clause - with SET, specific columns are updated
+                if upsert_action.update_set_clause.is_none() {
+                    let target_table = &upsert_action.target_id;
+                    if let Ok(relation) = catalog.get_relation(target_table) {
+                        let table_col_count = relation.abstract_definition().attribute_list.len();
+                        let select_col_count = select.projection.len();
+
+                        // Count only non-wildcard columns for accurate comparison
+                        // Wildcards (SELECT *) are expanded later, so we can't validate them here
+                        let has_wildcard = select.projection.iter().any(|p| {
+                            matches!(
+                                p,
+                                sqlparser::ast::SelectItem::Wildcard(_)
+                                    | sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+                            )
+                        });
+
+                        if !has_wildcard && select_col_count != table_col_count {
+                            return Err(ConverterError::SchemaMismatch(format!(
+                                "UPSERT column count mismatch: SELECT has {} columns, \
+                                 but table '{}' has {} columns. \
+                                 Use explicit column list or SET clause for partial updates.",
+                                select_col_count, target_table, table_col_count
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // First convert the source SELECT query normally
+        let mut query = Self::convert_query_internal(source_query, catalog, None)?;
+
+        // Replace the output action with the upsert action
+        let output_stream = OutputStream::new(output_action, None);
+        query = query.out_stream(output_stream);
+
+        Ok(query)
+    }
+
     /// Convert PARTITION statement to Partition execution element
     pub fn convert_partition(
         partition_keys: &[PartitionKey],
@@ -575,26 +697,48 @@ impl SqlConverter {
             }
         };
 
+        // Register join aliases in catalog for ON condition expression parsing
+        // This allows expressions like "a.symbol = b.company" where a and b are aliases
+        let effective_catalog: std::borrow::Cow<'_, SqlCatalog> = {
+            let left_alias = left_stream_name.get_stream_reference_id_str();
+            let right_alias = right_stream_name.get_stream_reference_id_str();
+
+            if left_alias.is_some() || right_alias.is_some() {
+                let mut catalog_with_aliases = catalog.clone();
+                if let Some(alias) = left_alias {
+                    let stream_id = left_stream_name.get_stream_id_str();
+                    catalog_with_aliases.register_alias(alias.to_string(), stream_id.to_string());
+                }
+                if let Some(alias) = right_alias {
+                    let stream_id = right_stream_name.get_stream_id_str();
+                    catalog_with_aliases.register_alias(alias.to_string(), stream_id.to_string());
+                }
+                std::borrow::Cow::Owned(catalog_with_aliases)
+            } else {
+                std::borrow::Cow::Borrowed(catalog)
+            }
+        };
+
         // Extract join type and ON condition together
         // Note: In SQL, plain JOIN and INNER JOIN are identical (ANSI standard),
         // so we normalize them to InnerJoin for consistency
         let (join_type, on_condition) = match &join.join_operator {
             // INNER JOIN variants (normalize plain JOIN to INNER JOIN)
             JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
-                let cond = Self::extract_on_condition(constraint, catalog)?;
+                let cond = Self::extract_on_condition(constraint, &effective_catalog)?;
                 (JoinType::InnerJoin, cond)
             }
             // OUTER JOIN variants
             JoinOperator::LeftOuter(constraint) => {
-                let cond = Self::extract_on_condition(constraint, catalog)?;
+                let cond = Self::extract_on_condition(constraint, &effective_catalog)?;
                 (JoinType::LeftOuterJoin, cond)
             }
             JoinOperator::RightOuter(constraint) => {
-                let cond = Self::extract_on_condition(constraint, catalog)?;
+                let cond = Self::extract_on_condition(constraint, &effective_catalog)?;
                 (JoinType::RightOuterJoin, cond)
             }
             JoinOperator::FullOuter(constraint) => {
-                let cond = Self::extract_on_condition(constraint, catalog)?;
+                let cond = Self::extract_on_condition(constraint, &effective_catalog)?;
                 (JoinType::FullOuterJoin, cond)
             }
             _ => {

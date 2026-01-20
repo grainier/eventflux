@@ -151,6 +151,85 @@ JOIN Products AS p
 INSERT INTO EnrichedOrders;
 ```
 
+## Stream and Table Aliases
+
+Aliases provide shorthand names for streams and tables in joins, making queries more readable and enabling self-joins.
+
+### Basic Alias Syntax
+
+Use `AS` to assign an alias to a stream or table:
+
+```sql
+SELECT s.symbol, s.price, t.description
+FROM StockStream AS s
+WINDOW TUMBLING(1 sec)
+JOIN StockTable AS t
+  ON s.symbol = t.symbol
+INSERT INTO EnrichedStock;
+```
+
+### Self-Joins
+
+Aliases are required when joining a stream or table with itself. This is useful for comparing events within the same stream:
+
+```sql
+DEFINE STREAM StockStream (symbol STRING, price DOUBLE, volume INT);
+
+-- Compare consecutive price changes for the same symbol
+SELECT a.symbol,
+       a.price AS price1,
+       b.price AS price2,
+       b.price - a.price AS price_diff
+FROM StockStream AS a
+WINDOW TUMBLING(5 sec)
+JOIN StockStream AS b
+  ON a.symbol = b.symbol
+WHERE b.price > a.price
+INSERT INTO PriceIncreases;
+```
+
+### Mixed Alias Usage
+
+You can alias only the streams/tables you need:
+
+```sql
+-- Alias left stream only
+SELECT s.symbol, s.price, StockTable.description
+FROM StockStream AS s
+WINDOW TUMBLING(1 sec)
+JOIN StockTable
+  ON s.symbol = StockTable.symbol
+INSERT INTO Output;
+
+-- Alias right stream only
+SELECT StockStream.symbol, t.description
+FROM StockStream
+WINDOW TUMBLING(1 sec)
+JOIN StockTable AS t
+  ON StockStream.symbol = t.symbol
+INSERT INTO Output;
+```
+
+### Alias Scope
+
+- Aliases are scoped to the query where they are defined
+- Once aliased, use the alias (not the original name) to reference columns
+- Aliases work in SELECT, ON, WHERE, GROUP BY, and HAVING clauses
+
+```sql
+SELECT a.symbol,
+       a.price,
+       b.bid,
+       b.ask
+FROM Trades AS a
+WINDOW TUMBLING(1 sec)
+JOIN Quotes AS b
+  ON a.symbol = b.symbol
+WHERE a.price > b.ask  -- Use aliases in WHERE
+GROUP BY a.symbol      -- Use aliases in GROUP BY
+INSERT INTO Analysis;
+```
+
 ## Join with Aggregations
 
 Combine joins with window aggregations:

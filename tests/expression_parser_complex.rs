@@ -72,6 +72,7 @@ fn test_parse_expression_multi_stream_variable() {
         },
         default_source: "A".to_string(),
         query_name: "Q1",
+        is_mutation_context: false,
     };
 
     let var_a = Variable::new("val".to_string()).of_stream("A".to_string());
@@ -99,6 +100,7 @@ fn test_compare_type_coercion_int_double() {
         stream_positions: HashMap::new(),
         default_source: "dummy".to_string(),
         query_name: "Q2",
+        is_mutation_context: false,
     };
 
     let expr = Expression::compare(
@@ -139,6 +141,7 @@ fn test_variable_not_found_error() {
         },
         default_source: "A".to_string(),
         query_name: "Q3",
+        is_mutation_context: false,
     };
 
     let mut var_b = Variable::new("missing".to_string()).of_stream("A".to_string());
@@ -176,6 +179,7 @@ fn test_table_variable_resolution() {
         },
         default_source: "T".to_string(),
         query_name: "Q4",
+        is_mutation_context: false,
     };
 
     let var = Variable::new("val".to_string()).of_stream("T".to_string());
@@ -267,6 +271,7 @@ fn test_custom_udf_plus_one() {
         stream_positions: HashMap::new(),
         default_source: "dummy".to_string(),
         query_name: "Q5",
+        is_mutation_context: false,
     };
 
     let expr = Expression::function_no_ns("plusOne".to_string(), vec![Expression::value_int(4)]);
@@ -391,6 +396,7 @@ fn test_join_query_parsing() {
         },
         default_source: "S1".to_string(),
         query_name: "J",
+        is_mutation_context: false,
     };
     let exec = parse_expression(&cond_expr, &ctx).unwrap();
     assert_eq!(exec.get_return_type(), AttrType::BOOL);

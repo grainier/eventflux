@@ -410,6 +410,7 @@ fn setup_state_join(
         },
         default_source: "Left".to_string(),
         query_name: "q",
+        is_mutation_context: false,
     };
 
     let cond_exec = None;
