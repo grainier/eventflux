@@ -67,8 +67,8 @@ function HeroSection() {
             <span className={styles.statLabel}>Events/sec</span>
           </div>
           <div className={styles.stat}>
-            <span className={styles.statNumber}>0</span>
-            <span className={styles.statLabel}>Garbage Collection</span>
+            <span className={styles.statNumber}>100%</span>
+            <span className={styles.statLabel}>Memory Safe</span>
           </div>
           <div className={styles.stat}>
             <span className={styles.statNumber}>SQL</span>
@@ -195,6 +195,41 @@ SELECT symbol, price,
 FROM TradeInput WHERE volume > 1000;`,
       language: 'sql',
       reversed: false,
+    },
+    {
+      title: 'Real-Time State Management',
+      icon: '🗃️',
+      scenario:
+        'Maintain synchronized state tables from streaming data. Use UPSERT to insert new records or update existing ones, UPDATE to modify specific fields, and DELETE to remove stale entries—all triggered by stream events.',
+      code: `-- Product catalog table
+CREATE TABLE ProductCatalog (
+    sku STRING, name STRING, price DOUBLE, stock INT
+) WITH (extension = 'inMemory');
+
+-- Incoming inventory updates
+CREATE STREAM InventoryStream (
+    sku STRING, name STRING, price DOUBLE, stock INT
+);
+
+-- UPSERT: Insert new products or update existing
+UPSERT INTO ProductCatalog
+SELECT sku, name, price, stock
+FROM InventoryStream
+ON ProductCatalog.sku = InventoryStream.sku;
+
+-- UPDATE: Adjust prices from a separate stream
+CREATE STREAM PriceUpdateStream (sku STRING, newPrice DOUBLE);
+UPDATE ProductCatalog SET price = PriceUpdateStream.newPrice
+FROM PriceUpdateStream
+WHERE ProductCatalog.sku = PriceUpdateStream.sku;
+
+-- DELETE: Remove discontinued products
+CREATE STREAM DiscontinuedStream (sku STRING);
+DELETE FROM ProductCatalog
+USING DiscontinuedStream
+WHERE ProductCatalog.sku = DiscontinuedStream.sku;`,
+      language: 'sql',
+      reversed: true,
     },
   ];
 
