@@ -269,6 +269,100 @@ DEFINE STREAM Input (
 );
 ```
 
+## Output Rate Limiting
+
+Output rate limiting controls the rate at which events are emitted from a query. This is useful for:
+- **Throttling bursts** - Prevent downstream systems from being overwhelmed
+- **Batching for efficiency** - Group events for more efficient processing
+- **Resource control** - Reduce memory and CPU usage during peak periods
+
+### Syntax
+
+```sql
+SELECT ...
+FROM StreamName
+OUTPUT [ALL | FIRST | LAST | SNAPSHOT] EVERY <value> [EVENTS | <time_unit>];
+```
+
+### Event-Based Rate Limiting
+
+Emit events after a specified number of events have been received:
+
+```sql
+-- Emit all accumulated events every 10 events
+SELECT symbol, price
+FROM StockTrades
+OUTPUT ALL EVERY 10 EVENTS;
+
+-- Emit only the first event of every 5-event batch
+SELECT symbol, price
+FROM StockTrades
+OUTPUT FIRST EVERY 5 EVENTS;
+
+-- Emit only the last event of every 5-event batch
+SELECT symbol, price
+FROM StockTrades
+OUTPUT LAST EVERY 5 EVENTS;
+```
+
+### Time-Based Rate Limiting
+
+Emit events at fixed time intervals:
+
+```sql
+-- Emit all accumulated events every second
+SELECT symbol, price
+FROM StockTrades
+OUTPUT ALL EVERY 1 SECONDS;
+
+-- Emit first event received every 500 milliseconds
+SELECT symbol, price
+FROM StockTrades
+OUTPUT FIRST EVERY 500 MILLISECONDS;
+
+-- Emit last event received every 2 minutes
+SELECT symbol, price
+FROM StockTrades
+OUTPUT LAST EVERY 2 MINUTES;
+```
+
+### Snapshot Rate Limiting
+
+For windowed queries, emit the current aggregation state at regular intervals:
+
+```sql
+-- Emit aggregation snapshot every 500ms
+SELECT symbol, SUM(price) AS total
+FROM StockTrades
+WINDOW TUMBLING(1 min)
+GROUP BY symbol
+OUTPUT SNAPSHOT EVERY 500 MILLISECONDS;
+```
+
+### Supported Time Units
+
+| Unit | Example |
+|------|---------|
+| `MILLISECONDS` | `100 MILLISECONDS` |
+| `SECONDS` | `5 SECONDS` |
+| `MINUTES` | `2 MINUTES` |
+| `HOURS` | `1 HOURS` |
+
+### Behavior Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `ALL` | Emit all accumulated events when threshold is reached | Complete batch processing |
+| `FIRST` | Emit only the first event of each batch | Sampling, detecting batch starts |
+| `LAST` | Emit only the last event of each batch | Getting most recent state |
+| `SNAPSHOT` | Emit current aggregation state (time-based only) | Periodic state reporting |
+
+:::note
+- `SNAPSHOT` mode can only be used with time-based intervals, not event counts
+- Partial batches are flushed on shutdown to prevent data loss
+- Rate limiting works with windows, aggregations, and filters
+:::
+
 ## Best Practices
 
 :::tip Query Design Tips
@@ -277,6 +371,7 @@ DEFINE STREAM Input (
 2. **Use appropriate windows** - Choose window type based on your use case
 3. **Avoid SELECT \*** - Explicitly list needed columns for better performance
 4. **Name your outputs** - Use meaningful INSERT INTO targets for clarity
+5. **Use rate limiting wisely** - Apply output rate limiting to reduce load on downstream systems
 
 :::
 

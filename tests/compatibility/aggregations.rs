@@ -755,7 +755,6 @@ async fn order_by_test3_multiple_columns() {
 /// Snapshot output rate limiting
 /// Reference: SnapshotOutputRateLimitTestCase.java
 #[tokio::test]
-#[ignore = "OUTPUT SNAPSHOT syntax not yet supported"]
 async fn rate_limit_test1_snapshot() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -788,7 +787,6 @@ async fn rate_limit_test1_snapshot() {
 /// Event-based all output rate limiting
 /// Reference: EventOutputRateLimitTestCase.java
 #[tokio::test]
-#[ignore = "OUTPUT ALL EVERY syntax not yet supported"]
 async fn rate_limit_test2_events_all() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -815,7 +813,6 @@ async fn rate_limit_test2_events_all() {
 /// Event-based first output rate limiting
 /// Reference: EventOutputRateLimitTestCase.java
 #[tokio::test]
-#[ignore = "OUTPUT FIRST EVERY syntax not yet supported"]
 async fn rate_limit_test3_events_first() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -842,7 +839,6 @@ async fn rate_limit_test3_events_first() {
 /// Event-based last output rate limiting
 /// Reference: EventOutputRateLimitTestCase.java
 #[tokio::test]
-#[ignore = "OUTPUT LAST EVERY syntax not yet supported"]
 async fn rate_limit_test4_events_last() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -869,7 +865,6 @@ async fn rate_limit_test4_events_last() {
 /// Time-based output rate limiting
 /// Reference: TimeOutputRateLimitTestCase.java
 #[tokio::test]
-#[ignore = "OUTPUT ALL EVERY TIME syntax not yet supported"]
 async fn rate_limit_test5_time_all() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\

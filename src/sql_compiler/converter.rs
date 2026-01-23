@@ -5,9 +5,10 @@
 //! Converts SQL statements to EventFlux query_api::Query structures.
 
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, Expr as SqlExpr, JoinConstraint, JoinOperator, PartitionKey,
-    PatternExpression, PatternLogicalOp, PatternMode, Select as SqlSelect, SetExpr, Statement,
-    Subscript, TableFactor, UnaryOperator, WithinConstraint,
+    AccessExpr, BinaryOperator, Expr as SqlExpr, JoinConstraint, JoinOperator,
+    OutputRateLimit, OutputRateLimitMode, OutputRateLimitUnit, PartitionKey, PatternExpression,
+    PatternLogicalOp, PatternMode, Select as SqlSelect, SetExpr, Statement, Subscript,
+    TableFactor, UnaryOperator, WithinConstraint,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -27,6 +28,10 @@ use crate::query_api::execution::query::input::stream::single_input_stream::Sing
 use crate::query_api::execution::query::input::stream::state_input_stream::StateInputStream;
 use crate::query_api::execution::query::output::output_stream::{
     InsertIntoStreamAction, OutputStream, OutputStreamAction,
+};
+use crate::query_api::execution::query::output::ratelimit::{
+    EventsOutputRate, OutputRate, OutputRateBehavior, OutputRateVariant, SnapshotOutputRate,
+    TimeOutputRate,
 };
 use crate::query_api::execution::query::Query;
 use crate::query_api::expression::indexed_variable::{EventIndex, IndexedVariable};
@@ -305,6 +310,13 @@ impl SqlConverter {
             None => (None, None),
         };
 
+        // Convert OUTPUT rate limiting clause if present
+        let output_rate = sql_query
+            .output_rate_limit
+            .as_ref()
+            .map(Self::convert_output_rate_limit)
+            .transpose()?;
+
         match sql_query.body.as_ref() {
             SetExpr::Select(select) => Self::convert_select(
                 select,
@@ -313,11 +325,97 @@ impl SqlConverter {
                 limit,
                 offset,
                 output_stream_name,
+                output_rate,
             ),
             _ => Err(ConverterError::UnsupportedFeature(
                 "Only simple SELECT supported".to_string(),
             )),
         }
+    }
+
+    /// Convert sqlparser's OutputRateLimit to query_api's OutputRate
+    fn convert_output_rate_limit(
+        rate_limit: &OutputRateLimit,
+    ) -> Result<OutputRate, ConverterError> {
+        // Validate rate limit value is positive
+        if rate_limit.value == 0 {
+            return Err(ConverterError::ConversionFailed(
+                "Rate limit value must be greater than 0".to_string(),
+            ));
+        }
+
+        let variant = match rate_limit.unit {
+            OutputRateLimitUnit::Events => {
+                // SNAPSHOT mode is not valid with EVENTS - parser should catch this,
+                // but add defensive check for safety
+                if matches!(rate_limit.mode, OutputRateLimitMode::Snapshot) {
+                    return Err(ConverterError::UnsupportedFeature(
+                        "SNAPSHOT mode is not supported with EVENTS - use time units instead"
+                            .to_string(),
+                    ));
+                }
+
+                // Convert mode to behavior for event-based rate limiting
+                let behavior = match rate_limit.mode {
+                    OutputRateLimitMode::All => OutputRateBehavior::All,
+                    OutputRateLimitMode::First => OutputRateBehavior::First,
+                    OutputRateLimitMode::Last => OutputRateBehavior::Last,
+                    OutputRateLimitMode::Snapshot => unreachable!("Handled above"),
+                };
+
+                // Event-based rate limiting - validate value fits in i32.
+                // Note: The API uses i32 for historical reasons; runtime converts to usize.
+                // Future improvement: change API type to usize for more idiomatic Rust.
+                let event_count: i32 = rate_limit.value.try_into().map_err(|_| {
+                    ConverterError::ConversionFailed(format!(
+                        "Event count {} exceeds maximum value {}",
+                        rate_limit.value,
+                        i32::MAX
+                    ))
+                })?;
+                OutputRateVariant::Events(EventsOutputRate::new(event_count), behavior)
+            }
+            OutputRateLimitUnit::Milliseconds
+            | OutputRateLimitUnit::Seconds
+            | OutputRateLimitUnit::Minutes
+            | OutputRateLimitUnit::Hours => {
+                // Convert to milliseconds - may fail on overflow
+                let millis_u64 = rate_limit.unit.to_millis(rate_limit.value).ok_or_else(|| {
+                    ConverterError::ConversionFailed(
+                        "Time value overflowed during conversion to milliseconds".to_string(),
+                    )
+                })?;
+
+                // Safely convert to i64 to prevent overflow.
+                // Note: The API uses i64 for historical reasons; u64 would be more idiomatic
+                // for time durations. Future improvement: change API type to u64.
+                let millis: i64 = millis_u64.try_into().map_err(|_| {
+                    ConverterError::ConversionFailed(format!(
+                        "Time value {} milliseconds exceeds maximum value {}",
+                        millis_u64,
+                        i64::MAX
+                    ))
+                })?;
+
+                // Convert mode to appropriate variant
+                match rate_limit.mode {
+                    OutputRateLimitMode::Snapshot => {
+                        OutputRateVariant::Snapshot(SnapshotOutputRate::new(millis))
+                    }
+                    OutputRateLimitMode::All => {
+                        OutputRateVariant::Time(TimeOutputRate::new(millis), OutputRateBehavior::All)
+                    }
+                    OutputRateLimitMode::First => {
+                        OutputRateVariant::Time(TimeOutputRate::new(millis), OutputRateBehavior::First)
+                    }
+                    OutputRateLimitMode::Last => {
+                        OutputRateVariant::Time(TimeOutputRate::new(millis), OutputRateBehavior::Last)
+                    }
+                }
+            }
+        };
+
+        Ok(OutputRate::new(variant))
     }
 
     /// Convert SELECT statement to Query
@@ -328,6 +426,7 @@ impl SqlConverter {
         limit: Option<&SqlExpr>,
         offset: Option<&sqlparser::ast::Offset>,
         output_stream_name: Option<String>,
+        output_rate: Option<OutputRate>,
     ) -> Result<Query, ConverterError> {
         // Check if this is a JOIN query
         let has_join = !select.from.is_empty() && !select.from[0].joins.is_empty();
@@ -531,10 +630,15 @@ impl SqlConverter {
         let output_stream = OutputStream::new(OutputStreamAction::InsertInto(output_action), None);
 
         // Build Query
-        let query = Query::query()
+        let mut query = Query::query()
             .from(input_stream)
             .select(selector)
             .out_stream(output_stream);
+
+        // Add OUTPUT rate limiting if present
+        if let Some(rate) = output_rate {
+            query = query.output(rate);
+        }
 
         // Validate query for type correctness (no allocation, uses catalog reference)
         let type_engine = TypeInferenceEngine::new(catalog);
