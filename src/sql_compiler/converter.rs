@@ -969,6 +969,37 @@ impl SqlConverter {
                 }
                 Ok(stream.window(None, WINDOW_TYPE_SORT.to_string(), converted_params))
             }
+            StreamingWindowSpec::Unique { key_attr } => {
+                let key_expr = Self::convert_expression(key_attr, catalog)?;
+                Ok(stream.window(None, "unique".to_string(), vec![key_expr]))
+            }
+            StreamingWindowSpec::FirstUnique { key_attr } => {
+                let key_expr = Self::convert_expression(key_attr, catalog)?;
+                Ok(stream.window(None, "firstUnique".to_string(), vec![key_expr]))
+            }
+            StreamingWindowSpec::Delay { duration } => {
+                let duration_expr = Self::convert_expression(duration, catalog)?;
+                Ok(stream.window(None, "delay".to_string(), vec![duration_expr]))
+            }
+            StreamingWindowSpec::Expression { condition } => {
+                // Expression window takes a string condition
+                let condition_expr = Expression::value_string(condition.clone());
+                Ok(stream.window(None, "expression".to_string(), vec![condition_expr]))
+            }
+            StreamingWindowSpec::Frequent { parameters } => {
+                let mut converted_params = Vec::new();
+                for param in parameters {
+                    converted_params.push(Self::convert_expression(param, catalog)?);
+                }
+                Ok(stream.window(None, "frequent".to_string(), converted_params))
+            }
+            StreamingWindowSpec::LossyFrequent { parameters } => {
+                let mut converted_params = Vec::new();
+                for param in parameters {
+                    converted_params.push(Self::convert_expression(param, catalog)?);
+                }
+                Ok(stream.window(None, "lossyFrequent".to_string(), converted_params))
+            }
         }
     }
 

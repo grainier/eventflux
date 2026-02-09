@@ -11,8 +11,8 @@ use crate::core::query::processor::{CommonProcessorMeta, ProcessingMode, Process
 use crate::core::util::scheduler::{Schedulable, Scheduler};
 use crate::query_api::execution::query::input::handler::WindowHandler;
 use crate::query_api::expression::{constant::ConstantValueWithFloat, Expression};
-use std::collections::VecDeque;
-use std::fmt::Debug;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::{Debug, Write};
 use std::sync::{Arc, Mutex};
 
 // Import StateHolder trait and related types
@@ -1987,6 +1987,1188 @@ impl WindowProcessorFactory for SortWindowFactory {
         parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
     ) -> Result<Arc<Mutex<dyn Processor>>, String> {
         Ok(Arc::new(Mutex::new(SortWindowProcessor::from_handler(
+            handler, app_ctx, query_ctx, parse_ctx,
+        )?)))
+    }
+
+    fn clone_box(&self) -> Box<dyn WindowProcessorFactory> {
+        Box::new(Self {})
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS FOR WINDOW PROCESSORS
+// ============================================================================
+
+/// Resolve attribute name expressions to their indices in before_window_data.
+fn resolve_key_indices(
+    params: &[Expression],
+    parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+) -> Result<Vec<usize>, String> {
+    if params.is_empty() {
+        return Ok(Vec::new());
+    }
+    let meta = parse_ctx.stream_meta_map.get(&parse_ctx.default_source)
+        .ok_or_else(|| format!("No stream metadata for '{}'", parse_ctx.default_source))?;
+    let mut indices = Vec::new();
+    for param in params {
+        if let Expression::Variable(var) = param {
+            let (idx, _) = meta.find_attribute_info(&var.attribute_name)
+                .ok_or_else(|| format!("Attribute '{}' not found in stream", var.attribute_name))?;
+            indices.push(*idx);
+        }
+    }
+    Ok(indices)
+}
+
+/// Generate a composite key from stream attribute values.
+/// If `key_indices` is non-empty, uses only those attribute positions.
+/// Otherwise, uses all attributes from before_window_data.
+/// Uses a null byte separator to avoid collisions.
+fn generate_composite_key(event: &StreamEvent, key_indices: &[usize]) -> String {
+    let mut buf = String::new();
+    if key_indices.is_empty() {
+        for (i, v) in event.before_window_data.iter().enumerate() {
+            if i > 0 { buf.push('\0'); }
+            let _ = write!(buf, "{}", v);
+        }
+    } else {
+        let mut first = true;
+        for &idx in key_indices {
+            if let Some(v) = event.before_window_data.get(idx) {
+                if !first { buf.push('\0'); }
+                let _ = write!(buf, "{}", v);
+                first = false;
+            }
+        }
+    }
+    buf
+}
+
+// ============================================================================
+// UNIQUE WINDOW PROCESSOR
+// Keeps only one event per unique key value (the latest occurrence)
+// Reference: Similar to Siddhi's unique extension
+// ============================================================================
+
+/// UniqueWindowProcessor keeps only the latest event per unique key value.
+/// When a new event arrives with a key that already exists, the old event is expired.
+/// Supports composite keys (e.g., `unique(symbol, exchange)`).
+///
+/// **Warning**: The `unique_map` grows with each distinct key value seen. For
+/// high-cardinality key spaces (e.g., UUIDs), this will consume increasing memory.
+/// This matches Java Siddhi's unique window behavior.
+#[derive(Debug)]
+pub struct UniqueWindowProcessor {
+    meta: CommonProcessorMeta,
+    /// Resolved indices of key attributes in before_window_data
+    key_attribute_indices: Vec<usize>,
+    /// Map from key value to stored event
+    unique_map: Arc<Mutex<HashMap<String, Arc<StreamEvent>>>>,
+}
+
+impl UniqueWindowProcessor {
+    pub fn new(
+        key_attribute_indices: Vec<usize>,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            key_attribute_indices,
+            unique_map: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn from_handler(
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Self, String> {
+        let params = handler.get_parameters();
+        if params.is_empty() {
+            return Err("Unique window requires at least one attribute parameter".to_string());
+        }
+        let key_attribute_indices = resolve_key_indices(params, parse_ctx)?;
+        if key_attribute_indices.is_empty() {
+            return Err("Unique window requires at least one attribute parameter".to_string());
+        }
+        Ok(Self::new(key_attribute_indices, app_ctx, query_ctx))
+    }
+}
+
+impl Processor for UniqueWindowProcessor {
+    fn process(&self, complex_event_chunk: Option<Box<dyn ComplexEvent>>) {
+        if let Some(ref next) = self.meta.next_processor {
+            if let Some(ref chunk) = complex_event_chunk {
+                let mut current_opt = Some(chunk.as_ref() as &dyn ComplexEvent);
+                let mut output_head: Option<Box<dyn ComplexEvent>> = None;
+                let mut output_tail = &mut output_head;
+                let mut map = self.unique_map.lock().unwrap();
+
+                while let Some(ev) = current_opt {
+                    if let Some(se) = ev.as_any().downcast_ref::<StreamEvent>() {
+                        let key = generate_composite_key(se, &self.key_attribute_indices);
+
+                        if let Some(old_event) = map.insert(key, Arc::new(se.clone_without_next())) {
+                            // Expire the old event with the same key
+                            let mut ex = old_event.as_ref().clone_without_next();
+                            ex.set_event_type(ComplexEventType::Expired);
+                            ex.set_timestamp(se.timestamp);
+                            *output_tail = Some(Box::new(ex));
+                            output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                        }
+
+                        *output_tail = Some(Box::new(se.clone_without_next()));
+                        output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                    }
+                    current_opt = ev.get_next();
+                }
+                drop(map);
+
+                if let Some(chain) = output_head {
+                    next.lock().unwrap().process(Some(chain));
+                }
+            } else {
+                next.lock().unwrap().process(None);
+            }
+        }
+    }
+
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn Processor>>> {
+        self.meta.next_processor.as_ref().map(Arc::clone)
+    }
+
+    fn set_next_processor(&mut self, next: Option<Arc<Mutex<dyn Processor>>>) {
+        self.meta.next_processor = next;
+    }
+
+    fn clone_processor(&self, query_ctx: &Arc<EventFluxQueryContext>) -> Box<dyn Processor> {
+        Box::new(Self::new(
+            self.key_attribute_indices.clone(),
+            Arc::clone(&self.meta.eventflux_app_context),
+            Arc::clone(query_ctx),
+        ))
+    }
+
+    fn get_eventflux_app_context(&self) -> Arc<EventFluxAppContext> {
+        Arc::clone(&self.meta.eventflux_app_context)
+    }
+
+    fn get_eventflux_query_context(&self) -> Arc<EventFluxQueryContext> {
+        self.meta.get_eventflux_query_context()
+    }
+
+    fn get_processing_mode(&self) -> ProcessingMode {
+        ProcessingMode::SLIDE
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+}
+
+impl WindowProcessor for UniqueWindowProcessor {}
+
+#[derive(Debug, Clone)]
+pub struct UniqueWindowFactory;
+
+impl WindowProcessorFactory for UniqueWindowFactory {
+    fn name(&self) -> &'static str {
+        "unique"
+    }
+
+    fn create(
+        &self,
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Arc<Mutex<dyn Processor>>, String> {
+        Ok(Arc::new(Mutex::new(UniqueWindowProcessor::from_handler(
+            handler, app_ctx, query_ctx, parse_ctx,
+        )?)))
+    }
+
+    fn clone_box(&self) -> Box<dyn WindowProcessorFactory> {
+        Box::new(Self {})
+    }
+}
+
+// ============================================================================
+// FIRST UNIQUE WINDOW PROCESSOR
+// Keeps only the first occurrence per unique key value
+// Reference: Siddhi's firstUnique extension
+// ============================================================================
+
+/// FirstUniqueWindowProcessor keeps only the first event per unique key value.
+/// Subsequent events with the same key are ignored (not even emitted).
+/// Supports composite keys (e.g., `firstUnique(user_id, session_id)`).
+///
+/// **Warning**: The `seen_keys` set grows unbounded over the lifetime of the window.
+/// For high-cardinality key spaces (e.g., UUIDs, transaction IDs), this will
+/// consume increasing memory. This matches Java Siddhi's firstUnique behavior.
+#[derive(Debug)]
+pub struct FirstUniqueWindowProcessor {
+    meta: CommonProcessorMeta,
+    /// Resolved indices of key attributes in before_window_data
+    key_attribute_indices: Vec<usize>,
+    /// Set of keys we've already seen
+    seen_keys: Arc<Mutex<HashSet<String>>>,
+}
+
+impl FirstUniqueWindowProcessor {
+    pub fn new(
+        key_attribute_indices: Vec<usize>,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            key_attribute_indices,
+            seen_keys: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    pub fn from_handler(
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Self, String> {
+        let params = handler.get_parameters();
+        if params.is_empty() {
+            return Err("FirstUnique window requires at least one attribute parameter".to_string());
+        }
+        let key_attribute_indices = resolve_key_indices(params, parse_ctx)?;
+        if key_attribute_indices.is_empty() {
+            return Err("FirstUnique window requires at least one attribute parameter".to_string());
+        }
+        Ok(Self::new(key_attribute_indices, app_ctx, query_ctx))
+    }
+}
+
+impl Processor for FirstUniqueWindowProcessor {
+    fn process(&self, complex_event_chunk: Option<Box<dyn ComplexEvent>>) {
+        if let Some(ref next) = self.meta.next_processor {
+            if let Some(ref chunk) = complex_event_chunk {
+                let mut current_opt = Some(chunk.as_ref() as &dyn ComplexEvent);
+                let mut output_head: Option<Box<dyn ComplexEvent>> = None;
+                let mut output_tail = &mut output_head;
+                let mut keys = self.seen_keys.lock().unwrap();
+
+                while let Some(ev) = current_opt {
+                    if let Some(se) = ev.as_any().downcast_ref::<StreamEvent>() {
+                        let key = generate_composite_key(se, &self.key_attribute_indices);
+
+                        if keys.insert(key) {
+                            *output_tail = Some(Box::new(se.clone_without_next()));
+                            output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                        }
+                    }
+                    current_opt = ev.get_next();
+                }
+                drop(keys);
+
+                if let Some(chain) = output_head {
+                    next.lock().unwrap().process(Some(chain));
+                }
+            } else {
+                next.lock().unwrap().process(None);
+            }
+        }
+    }
+
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn Processor>>> {
+        self.meta.next_processor.as_ref().map(Arc::clone)
+    }
+
+    fn set_next_processor(&mut self, next: Option<Arc<Mutex<dyn Processor>>>) {
+        self.meta.next_processor = next;
+    }
+
+    fn clone_processor(&self, query_ctx: &Arc<EventFluxQueryContext>) -> Box<dyn Processor> {
+        Box::new(Self::new(
+            self.key_attribute_indices.clone(),
+            Arc::clone(&self.meta.eventflux_app_context),
+            Arc::clone(query_ctx),
+        ))
+    }
+
+    fn get_eventflux_app_context(&self) -> Arc<EventFluxAppContext> {
+        Arc::clone(&self.meta.eventflux_app_context)
+    }
+
+    fn get_eventflux_query_context(&self) -> Arc<EventFluxQueryContext> {
+        self.meta.get_eventflux_query_context()
+    }
+
+    fn get_processing_mode(&self) -> ProcessingMode {
+        ProcessingMode::SLIDE
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+}
+
+impl WindowProcessor for FirstUniqueWindowProcessor {}
+
+#[derive(Debug, Clone)]
+pub struct FirstUniqueWindowFactory;
+
+impl WindowProcessorFactory for FirstUniqueWindowFactory {
+    fn name(&self) -> &'static str {
+        "firstUnique"
+    }
+
+    fn create(
+        &self,
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Arc<Mutex<dyn Processor>>, String> {
+        Ok(Arc::new(Mutex::new(FirstUniqueWindowProcessor::from_handler(
+            handler, app_ctx, query_ctx, parse_ctx,
+        )?)))
+    }
+
+    fn clone_box(&self) -> Box<dyn WindowProcessorFactory> {
+        Box::new(Self {})
+    }
+}
+
+// ============================================================================
+// DELAY WINDOW PROCESSOR
+// Holds events for a specific delay period before processing them
+// Reference: DelayWindowProcessor.java
+// ============================================================================
+
+/// DelayWindowProcessor delays event emission by a specified time period.
+/// Each event is individually scheduled for emission after the delay.
+#[derive(Debug)]
+pub struct DelayWindowProcessor {
+    meta: CommonProcessorMeta,
+    /// Delay duration in milliseconds
+    delay_ms: i64,
+    scheduler: Option<Arc<Scheduler>>,
+}
+
+#[derive(Clone)]
+struct DelayEmitTask {
+    event: Arc<StreamEvent>,
+    next: Option<Arc<Mutex<dyn Processor>>>,
+}
+
+impl Schedulable for DelayEmitTask {
+    fn on_time(&self, timestamp: i64) {
+        let mut event = self.event.as_ref().clone_without_next();
+        event.set_timestamp(timestamp);
+
+        if let Some(ref next) = self.next {
+            next.lock().unwrap().process(Some(Box::new(event)));
+        }
+    }
+}
+
+impl DelayWindowProcessor {
+    pub fn new(
+        delay_ms: i64,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        let scheduler = app_ctx.get_scheduler();
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            delay_ms,
+            scheduler,
+        }
+    }
+
+    fn new_cloned(
+        delay_ms: i64,
+        scheduler: Arc<Scheduler>,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            delay_ms,
+            scheduler: Some(scheduler),
+        }
+    }
+
+    pub fn from_handler(
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        _parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Self, String> {
+        let expr = handler
+            .get_parameters()
+            .first()
+            .ok_or("Delay window requires a delay duration parameter")?;
+
+        if let Expression::Constant(c) = expr {
+            let delay = match &c.value {
+                ConstantValueWithFloat::Time(t) => *t,
+                ConstantValueWithFloat::Int(i) => *i as i64,
+                ConstantValueWithFloat::Long(l) => *l,
+                _ => return Err("Delay window duration must be time or integer".to_string()),
+            };
+            let processor = Self::new(delay, app_ctx, query_ctx);
+            if processor.scheduler.is_none() {
+                return Err("Delay window requires a scheduler (not available in this context)".to_string());
+            }
+            Ok(processor)
+        } else {
+            Err("Delay window duration must be constant".to_string())
+        }
+    }
+}
+
+impl Processor for DelayWindowProcessor {
+    fn process(&self, complex_event_chunk: Option<Box<dyn ComplexEvent>>) {
+        if let Some(ref next) = self.meta.next_processor {
+            if let Some(ref scheduler) = self.scheduler {
+                if let Some(ref chunk) = complex_event_chunk {
+                    let mut current_opt = Some(chunk.as_ref() as &dyn ComplexEvent);
+                    while let Some(ev) = current_opt {
+                        if let Some(se) = ev.as_any().downcast_ref::<StreamEvent>() {
+                            let task = DelayEmitTask {
+                                event: Arc::new(se.clone_without_next()),
+                                next: Some(Arc::clone(next)),
+                            };
+                            scheduler.notify_at(se.timestamp + self.delay_ms, Arc::new(task));
+                        }
+                        current_opt = ev.get_next();
+                    }
+                }
+            } else {
+                next.lock().unwrap().process(complex_event_chunk);
+            }
+        }
+    }
+
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn Processor>>> {
+        self.meta.next_processor.as_ref().map(Arc::clone)
+    }
+
+    fn set_next_processor(&mut self, next: Option<Arc<Mutex<dyn Processor>>>) {
+        self.meta.next_processor = next;
+    }
+
+    fn clone_processor(&self, query_ctx: &Arc<EventFluxQueryContext>) -> Box<dyn Processor> {
+        let scheduler = self.scheduler.as_ref()
+            .expect("DelayWindowProcessor invariant violated: scheduler missing during clone")
+            .clone();
+        Box::new(Self::new_cloned(
+            self.delay_ms,
+            scheduler,
+            Arc::clone(&self.meta.eventflux_app_context),
+            Arc::clone(query_ctx),
+        ))
+    }
+
+    fn get_eventflux_app_context(&self) -> Arc<EventFluxAppContext> {
+        Arc::clone(&self.meta.eventflux_app_context)
+    }
+
+    fn get_eventflux_query_context(&self) -> Arc<EventFluxQueryContext> {
+        self.meta.get_eventflux_query_context()
+    }
+
+    fn get_processing_mode(&self) -> ProcessingMode {
+        ProcessingMode::SLIDE
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+}
+
+impl WindowProcessor for DelayWindowProcessor {}
+
+#[derive(Debug, Clone)]
+pub struct DelayWindowFactory;
+
+impl WindowProcessorFactory for DelayWindowFactory {
+    fn name(&self) -> &'static str {
+        "delay"
+    }
+
+    fn create(
+        &self,
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Arc<Mutex<dyn Processor>>, String> {
+        Ok(Arc::new(Mutex::new(DelayWindowProcessor::from_handler(
+            handler, app_ctx, query_ctx, parse_ctx,
+        )?)))
+    }
+
+    fn clone_box(&self) -> Box<dyn WindowProcessorFactory> {
+        Box::new(Self {})
+    }
+}
+
+// ============================================================================
+// FREQUENT WINDOW PROCESSOR
+// Tracks most frequently occurring events using Misra-Gries algorithm
+// Reference: FrequentWindowProcessor.java
+// ============================================================================
+
+/// FrequentWindowProcessor tracks the most frequently occurring events.
+/// Uses a counting algorithm based on Misra-Gries counting algorithm.
+///
+/// Usage: `WINDOW('frequent', count)` groups by all attributes.
+/// `WINDOW('frequent', count, attr1, attr2)` groups by specific attributes.
+#[derive(Debug)]
+pub struct FrequentWindowProcessor {
+    meta: CommonProcessorMeta,
+    /// Number of most frequent events to track
+    most_frequent_count: usize,
+    /// Attribute indices for key generation (empty = use all attributes)
+    key_attribute_indices: Vec<usize>,
+    state: Arc<Mutex<FrequentWindowState>>,
+}
+
+#[derive(Debug)]
+struct FrequentWindowState {
+    event_map: HashMap<String, Arc<StreamEvent>>,
+    count_map: HashMap<String, usize>,
+}
+
+impl FrequentWindowProcessor {
+    pub fn new(
+        most_frequent_count: usize,
+        key_attribute_indices: Vec<usize>,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            most_frequent_count,
+            key_attribute_indices,
+            state: Arc::new(Mutex::new(FrequentWindowState {
+                event_map: HashMap::new(),
+                count_map: HashMap::new(),
+            })),
+        }
+    }
+
+    pub fn from_handler(
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Self, String> {
+        let params = handler.get_parameters();
+        let expr = params
+            .first()
+            .ok_or("Frequent window requires event count parameter")?;
+
+        let count = if let Expression::Constant(c) = expr {
+            match &c.value {
+                ConstantValueWithFloat::Int(i) => *i as usize,
+                ConstantValueWithFloat::Long(l) => *l as usize,
+                _ => return Err("Frequent window count must be integer".to_string()),
+            }
+        } else {
+            return Err("Frequent window count must be constant".to_string());
+        };
+
+        // Resolve optional key attribute indices from remaining parameters
+        let key_attribute_indices = resolve_key_indices(&params[1..], parse_ctx)?;
+
+        Ok(Self::new(count, key_attribute_indices, app_ctx, query_ctx))
+    }
+}
+
+impl Processor for FrequentWindowProcessor {
+    fn process(&self, complex_event_chunk: Option<Box<dyn ComplexEvent>>) {
+        if let Some(ref next) = self.meta.next_processor {
+            if let Some(ref chunk) = complex_event_chunk {
+                let mut current_opt = Some(chunk.as_ref() as &dyn ComplexEvent);
+                let mut output_head: Option<Box<dyn ComplexEvent>> = None;
+                let mut output_tail = &mut output_head;
+                let mut state = self.state.lock().unwrap();
+
+                while let Some(ev) = current_opt {
+                    if let Some(se) = ev.as_any().downcast_ref::<StreamEvent>() {
+                        let key = generate_composite_key(se, &self.key_attribute_indices);
+                        let cloned = Arc::new(se.clone_without_next());
+
+                        if let Some(old) = state.event_map.insert(key.clone(), Arc::clone(&cloned)) {
+                            // Key exists — replacement policy: expire old, emit new
+                            *state.count_map.entry(key).or_insert(0) += 1;
+                            let mut ex = old.as_ref().clone_without_next();
+                            ex.set_event_type(ComplexEventType::Expired);
+                            ex.set_timestamp(se.timestamp);
+                            *output_tail = Some(Box::new(ex));
+                            output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                            *output_tail = Some(Box::new(se.clone_without_next()));
+                            output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                        } else {
+                            // New key
+                            if state.event_map.len() > self.most_frequent_count {
+                                // Over capacity — decrement all counts, evict zeros
+                                let mut keys_to_remove = Vec::new();
+                                for (k, count) in state.count_map.iter_mut() {
+                                    if *count <= 1 {
+                                        keys_to_remove.push(k.clone());
+                                    } else {
+                                        *count -= 1;
+                                    }
+                                }
+                                for k in &keys_to_remove {
+                                    state.count_map.remove(k);
+                                    if let Some(expired) = state.event_map.remove(k) {
+                                        let mut ex = expired.as_ref().clone_without_next();
+                                        ex.set_event_type(ComplexEventType::Expired);
+                                        ex.set_timestamp(se.timestamp);
+                                        *output_tail = Some(Box::new(ex));
+                                        output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                                    }
+                                }
+
+                                if state.event_map.len() > self.most_frequent_count {
+                                    // Still over limit, remove the new event
+                                    state.event_map.remove(&key);
+                                } else {
+                                    state.count_map.insert(key, 1);
+                                    *output_tail = Some(Box::new(se.clone_without_next()));
+                                    output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                                }
+                            } else {
+                                state.count_map.insert(key, 1);
+                                *output_tail = Some(Box::new(se.clone_without_next()));
+                                output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                            }
+                        }
+                    }
+                    current_opt = ev.get_next();
+                }
+                drop(state);
+
+                if let Some(chain) = output_head {
+                    next.lock().unwrap().process(Some(chain));
+                }
+            } else {
+                next.lock().unwrap().process(None);
+            }
+        }
+    }
+
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn Processor>>> {
+        self.meta.next_processor.as_ref().map(Arc::clone)
+    }
+
+    fn set_next_processor(&mut self, next: Option<Arc<Mutex<dyn Processor>>>) {
+        self.meta.next_processor = next;
+    }
+
+    fn clone_processor(&self, query_ctx: &Arc<EventFluxQueryContext>) -> Box<dyn Processor> {
+        Box::new(Self::new(
+            self.most_frequent_count,
+            self.key_attribute_indices.clone(),
+            Arc::clone(&self.meta.eventflux_app_context),
+            Arc::clone(query_ctx),
+        ))
+    }
+
+    fn get_eventflux_app_context(&self) -> Arc<EventFluxAppContext> {
+        Arc::clone(&self.meta.eventflux_app_context)
+    }
+
+    fn get_eventflux_query_context(&self) -> Arc<EventFluxQueryContext> {
+        self.meta.get_eventflux_query_context()
+    }
+
+    fn get_processing_mode(&self) -> ProcessingMode {
+        ProcessingMode::SLIDE
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+}
+
+impl WindowProcessor for FrequentWindowProcessor {}
+
+#[derive(Debug, Clone)]
+pub struct FrequentWindowFactory;
+
+impl WindowProcessorFactory for FrequentWindowFactory {
+    fn name(&self) -> &'static str {
+        "frequent"
+    }
+
+    fn create(
+        &self,
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Arc<Mutex<dyn Processor>>, String> {
+        Ok(Arc::new(Mutex::new(FrequentWindowProcessor::from_handler(
+            handler, app_ctx, query_ctx, parse_ctx,
+        )?)))
+    }
+
+    fn clone_box(&self) -> Box<dyn WindowProcessorFactory> {
+        Box::new(Self {})
+    }
+}
+
+// ============================================================================
+// LOSSY FREQUENT WINDOW PROCESSOR
+// Approximate frequent item tracking using Lossy Counting algorithm
+// Reference: LossyFrequentWindowProcessor.java
+// ============================================================================
+
+/// LossyCount tracks count and bucket ID for lossy counting algorithm
+#[derive(Debug, Clone)]
+struct LossyCount {
+    count: usize,
+    bucket_id: usize,
+}
+
+/// LossyFrequentWindowProcessor identifies events whose frequency exceeds
+/// a support threshold using the Lossy Counting algorithm.
+#[derive(Debug)]
+pub struct LossyFrequentWindowProcessor {
+    meta: CommonProcessorMeta,
+    /// Support threshold (0.0 - 1.0)
+    support: f64,
+    /// Error bound (0.0 - 1.0)
+    error: f64,
+    /// Window width = ceil(1/error), stored as integer for precision
+    window_width: usize,
+    /// Attribute indices for key generation (empty = use all attributes)
+    key_attribute_indices: Vec<usize>,
+    state: Arc<Mutex<LossyFrequentWindowState>>,
+}
+
+#[derive(Debug)]
+struct LossyFrequentWindowState {
+    total_count: usize,
+    current_bucket_id: usize,
+    count_map: HashMap<String, LossyCount>,
+    event_map: HashMap<String, Arc<StreamEvent>>,
+}
+
+impl LossyFrequentWindowProcessor {
+    pub fn new(
+        support: f64,
+        error: f64,
+        key_attribute_indices: Vec<usize>,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        let window_width = (1.0 / error).ceil() as usize;
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            support,
+            error,
+            window_width,
+            key_attribute_indices,
+            state: Arc::new(Mutex::new(LossyFrequentWindowState {
+                total_count: 0,
+                current_bucket_id: 1,
+                count_map: HashMap::new(),
+                event_map: HashMap::new(),
+            })),
+        }
+    }
+
+    pub fn from_handler(
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Self, String> {
+        let params = handler.get_parameters();
+
+        let support = match params.first() {
+            Some(Expression::Constant(c)) => match &c.value {
+                ConstantValueWithFloat::Float(f) => *f as f64,
+                ConstantValueWithFloat::Double(d) => *d,
+                _ => return Err("LossyFrequent support threshold must be a float".to_string()),
+            },
+            _ => return Err("LossyFrequent window requires support threshold".to_string()),
+        };
+
+        // Find where key attributes start (after support and optional error params)
+        let (error, key_params_start) = if params.len() > 1 {
+            match &params[1] {
+                Expression::Constant(c) => match &c.value {
+                    ConstantValueWithFloat::Float(f) => (*f as f64, 2),
+                    ConstantValueWithFloat::Double(d) => (*d, 2),
+                    _ => (support / 10.0, 1),
+                },
+                Expression::Variable(_) => (support / 10.0, 1),
+                _ => (support / 10.0, 1),
+            }
+        } else {
+            (support / 10.0, 1)
+        };
+
+        if !(0.0..=1.0).contains(&support) || error <= 0.0 || error > 1.0 {
+            return Err("Support must be between 0 and 1, error must be > 0 and <= 1".to_string());
+        }
+
+        // Resolve optional key attribute indices from remaining parameters
+        let key_attribute_indices = resolve_key_indices(&params[key_params_start..], parse_ctx)?;
+
+        Ok(Self::new(support, error, key_attribute_indices, app_ctx, query_ctx))
+    }
+}
+
+impl Processor for LossyFrequentWindowProcessor {
+    fn process(&self, complex_event_chunk: Option<Box<dyn ComplexEvent>>) {
+        if let Some(ref next) = self.meta.next_processor {
+            if let Some(ref chunk) = complex_event_chunk {
+                let mut current_opt = Some(chunk.as_ref() as &dyn ComplexEvent);
+                let mut output_head: Option<Box<dyn ComplexEvent>> = None;
+                let mut output_tail = &mut output_head;
+                let mut state = self.state.lock().unwrap();
+
+                while let Some(ev) = current_opt {
+                    if let Some(se) = ev.as_any().downcast_ref::<StreamEvent>() {
+                        state.total_count += 1;
+                        if state.total_count > 1 {
+                            state.current_bucket_id = state.total_count.div_ceil(self.window_width);
+                        }
+
+                        let key = generate_composite_key(se, &self.key_attribute_indices);
+                        let cloned = Arc::new(se.clone_without_next());
+
+                        // Update counts (always, independent of window membership)
+                        if let Some(lc) = state.count_map.get_mut(&key) {
+                            lc.count += 1;
+                        } else {
+                            let bucket_id = state.current_bucket_id.saturating_sub(1);
+                            state.count_map.insert(key.clone(), LossyCount {
+                                count: 1,
+                                bucket_id,
+                            });
+                        }
+
+                        // Check threshold to decide window membership
+                        let threshold = (self.support - self.error) * (state.total_count as f64);
+                        let meets_threshold = state.count_map.get(&key)
+                            .map_or(false, |lc| lc.count as f64 >= threshold);
+                        let was_in_window = state.event_map.contains_key(&key);
+
+                        if meets_threshold {
+                            if was_in_window {
+                                // Replace: expire old, emit new
+                                let old = state.event_map.insert(key, Arc::clone(&cloned)).unwrap();
+                                let mut ex = old.as_ref().clone_without_next();
+                                ex.set_event_type(ComplexEventType::Expired);
+                                ex.set_timestamp(se.timestamp);
+                                *output_tail = Some(Box::new(ex));
+                                output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                            } else {
+                                // New entry into window
+                                state.event_map.insert(key, Arc::clone(&cloned));
+                            }
+                            *output_tail = Some(Box::new(se.clone_without_next()));
+                            output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                        } else if was_in_window {
+                            // Fell below threshold — expire from window
+                            if let Some(old) = state.event_map.remove(&key) {
+                                let mut ex = old.as_ref().clone_without_next();
+                                ex.set_event_type(ComplexEventType::Expired);
+                                ex.set_timestamp(se.timestamp);
+                                *output_tail = Some(Box::new(ex));
+                                output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                            }
+                        }
+
+                        // Prune if at window boundary
+                        if state.total_count % self.window_width == 0 {
+                            let bucket_id = state.current_bucket_id;
+                            let keys_to_remove: Vec<String> = state.count_map.iter()
+                                .filter(|(_, lc)| lc.count + lc.bucket_id <= bucket_id)
+                                .map(|(k, _)| k.clone())
+                                .collect();
+                            for k in keys_to_remove {
+                                state.count_map.remove(&k);
+                                if let Some(expired) = state.event_map.remove(&k) {
+                                    let mut ex = expired.as_ref().clone_without_next();
+                                    ex.set_event_type(ComplexEventType::Expired);
+                                    ex.set_timestamp(se.timestamp);
+                                    *output_tail = Some(Box::new(ex));
+                                    output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                                }
+                            }
+                        }
+                    }
+                    current_opt = ev.get_next();
+                }
+                drop(state);
+
+                if let Some(chain) = output_head {
+                    next.lock().unwrap().process(Some(chain));
+                }
+            } else {
+                next.lock().unwrap().process(None);
+            }
+        }
+    }
+
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn Processor>>> {
+        self.meta.next_processor.as_ref().map(Arc::clone)
+    }
+
+    fn set_next_processor(&mut self, next: Option<Arc<Mutex<dyn Processor>>>) {
+        self.meta.next_processor = next;
+    }
+
+    fn clone_processor(&self, query_ctx: &Arc<EventFluxQueryContext>) -> Box<dyn Processor> {
+        Box::new(Self::new(
+            self.support,
+            self.error,
+            self.key_attribute_indices.clone(),
+            Arc::clone(&self.meta.eventflux_app_context),
+            Arc::clone(query_ctx),
+        ))
+    }
+
+    fn get_eventflux_app_context(&self) -> Arc<EventFluxAppContext> {
+        Arc::clone(&self.meta.eventflux_app_context)
+    }
+
+    fn get_eventflux_query_context(&self) -> Arc<EventFluxQueryContext> {
+        self.meta.get_eventflux_query_context()
+    }
+
+    fn get_processing_mode(&self) -> ProcessingMode {
+        ProcessingMode::SLIDE
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+}
+
+impl WindowProcessor for LossyFrequentWindowProcessor {}
+
+#[derive(Debug, Clone)]
+pub struct LossyFrequentWindowFactory;
+
+impl WindowProcessorFactory for LossyFrequentWindowFactory {
+    fn name(&self) -> &'static str {
+        "lossyFrequent"
+    }
+
+    fn create(
+        &self,
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Arc<Mutex<dyn Processor>>, String> {
+        Ok(Arc::new(Mutex::new(LossyFrequentWindowProcessor::from_handler(
+            handler, app_ctx, query_ctx, parse_ctx,
+        )?)))
+    }
+
+    fn clone_box(&self) -> Box<dyn WindowProcessorFactory> {
+        Box::new(Self {})
+    }
+}
+
+// ============================================================================
+// EXPRESSION WINDOW PROCESSOR
+// Count-based sliding window parsed from an expression string
+// Reference: ExpressionWindowProcessor.java (simplified version)
+// ============================================================================
+
+/// ExpressionWindowProcessor is a sliding window sized by a count expression
+/// parsed at construction time (e.g., `count() <= 20` keeps at most 20 events).
+///
+/// **Supported expressions**: `count() <= N` and `count() < N` only.
+/// The expression is parsed once during initialization — it is NOT evaluated
+/// dynamically per event. Unsupported expressions are rejected at construction.
+#[derive(Debug)]
+pub struct ExpressionWindowProcessor {
+    meta: CommonProcessorMeta,
+    /// The expression string (e.g., "count() <= 20")
+    expression: String,
+    /// Max count extracted from simple expressions
+    max_count: Option<usize>,
+    /// Buffer of events
+    buffer: Arc<Mutex<VecDeque<Arc<StreamEvent>>>>,
+}
+
+impl ExpressionWindowProcessor {
+    pub fn new(
+        expression: String,
+        max_count: Option<usize>,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+    ) -> Self {
+        Self {
+            meta: CommonProcessorMeta::new(app_ctx, query_ctx),
+            expression,
+            max_count,
+            buffer: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    fn parse_count_expression(expr: &str) -> Option<usize> {
+        // Simple regex-free parsing for "count() <= N" or "count() < N"
+        // Remove all whitespace to tolerate "count( ) <= 5" or extra spacing
+        let expr = expr.replace(' ', "").to_lowercase();
+        if expr.starts_with("count()") {
+            let rest = expr.trim_start_matches("count()").trim();
+            if rest.starts_with("<=") {
+                rest.trim_start_matches("<=").trim().parse().ok()
+            } else if rest.starts_with("<") {
+                rest.trim_start_matches("<").trim().parse::<usize>().ok()
+                    .map(|n| n.saturating_sub(1))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn from_handler(
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        _parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Self, String> {
+        let expr = handler
+            .get_parameters()
+            .first()
+            .ok_or("Expression window requires an expression parameter")?;
+
+        if let Expression::Constant(c) = expr {
+            if let ConstantValueWithFloat::String(s) = &c.value {
+                let max_count = Self::parse_count_expression(s);
+                if max_count.is_none() {
+                    return Err(format!(
+                        "Unsupported expression window condition: '{}'. \
+                         Currently supported: 'count() <= N' and 'count() < N'",
+                        s
+                    ));
+                }
+                Ok(Self::new(s.clone(), max_count, app_ctx, query_ctx))
+            } else {
+                Err("Expression must be a string".to_string())
+            }
+        } else {
+            Err("Expression window parameter must be constant string".to_string())
+        }
+    }
+}
+
+impl Processor for ExpressionWindowProcessor {
+    fn process(&self, complex_event_chunk: Option<Box<dyn ComplexEvent>>) {
+        if let Some(ref next) = self.meta.next_processor {
+            if let Some(ref chunk) = complex_event_chunk {
+                let mut current_opt = Some(chunk.as_ref() as &dyn ComplexEvent);
+                let mut output_head: Option<Box<dyn ComplexEvent>> = None;
+                let mut output_tail = &mut output_head;
+
+                while let Some(ev) = current_opt {
+                    if let Some(se) = ev.as_any().downcast_ref::<StreamEvent>() {
+                        {
+                            let mut buf = self.buffer.lock().unwrap();
+                            buf.push_back(Arc::new(se.clone_without_next()));
+
+                            // Expire events that violate the expression
+                            if let Some(max) = self.max_count {
+                                while buf.len() > max {
+                                    if let Some(old) = buf.pop_front() {
+                                        let mut ex = old.as_ref().clone_without_next();
+                                        ex.set_event_type(ComplexEventType::Expired);
+                                        ex.set_timestamp(se.timestamp);
+                                        *output_tail = Some(Box::new(ex));
+                                        output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Add current event
+                        *output_tail = Some(Box::new(se.clone_without_next()));
+                        output_tail = output_tail.as_mut().unwrap().mut_next_ref_option();
+                    }
+                    current_opt = ev.get_next();
+                }
+
+                if let Some(chain) = output_head {
+                    next.lock().unwrap().process(Some(chain));
+                }
+            } else {
+                next.lock().unwrap().process(None);
+            }
+        }
+    }
+
+    fn next_processor(&self) -> Option<Arc<Mutex<dyn Processor>>> {
+        self.meta.next_processor.as_ref().map(Arc::clone)
+    }
+
+    fn set_next_processor(&mut self, next: Option<Arc<Mutex<dyn Processor>>>) {
+        self.meta.next_processor = next;
+    }
+
+    fn clone_processor(&self, query_ctx: &Arc<EventFluxQueryContext>) -> Box<dyn Processor> {
+        Box::new(Self::new(
+            self.expression.clone(),
+            self.max_count,
+            Arc::clone(&self.meta.eventflux_app_context),
+            Arc::clone(query_ctx),
+        ))
+    }
+
+    fn get_eventflux_app_context(&self) -> Arc<EventFluxAppContext> {
+        Arc::clone(&self.meta.eventflux_app_context)
+    }
+
+    fn get_eventflux_query_context(&self) -> Arc<EventFluxQueryContext> {
+        self.meta.get_eventflux_query_context()
+    }
+
+    fn get_processing_mode(&self) -> ProcessingMode {
+        ProcessingMode::SLIDE
+    }
+
+    fn is_stateful(&self) -> bool {
+        true
+    }
+}
+
+impl WindowProcessor for ExpressionWindowProcessor {}
+
+#[derive(Debug, Clone)]
+pub struct ExpressionWindowFactory;
+
+impl WindowProcessorFactory for ExpressionWindowFactory {
+    fn name(&self) -> &'static str {
+        "expression"
+    }
+
+    fn create(
+        &self,
+        handler: &WindowHandler,
+        app_ctx: Arc<EventFluxAppContext>,
+        query_ctx: Arc<EventFluxQueryContext>,
+        parse_ctx: &crate::core::util::parser::expression_parser::ExpressionParserContext,
+    ) -> Result<Arc<Mutex<dyn Processor>>, String> {
+        Ok(Arc::new(Mutex::new(ExpressionWindowProcessor::from_handler(
             handler, app_ctx, query_ctx, parse_ctx,
         )?)))
     }

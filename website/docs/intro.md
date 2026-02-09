@@ -21,7 +21,7 @@ EventFlux has **1,400+ passing tests** covering all core functionality:
 | Feature | Status | Tests |
 |---------|--------|-------|
 | **SQL Parser** | Production Ready | Native streaming extensions |
-| **9 Window Types** | Production Ready | 200+ tests |
+| **14 Window Types** | Production Ready | 200+ tests |
 | **Pattern Matching** | Production Ready | 370+ tests |
 | **Joins** | Production Ready | INNER, LEFT, RIGHT, FULL |
 | **Aggregations** | Production Ready | COUNT, SUM, AVG, MIN, MAX, STDDEV |
@@ -51,7 +51,7 @@ INSERT INTO Alerts;
 
 ### Comprehensive Window Support
 
-EventFlux supports **9 window types** for different streaming scenarios:
+EventFlux supports **14 window types** for different streaming scenarios:
 
 | Window Type | Description | Use Case |
 |-------------|-------------|----------|
@@ -64,6 +64,11 @@ EventFlux supports **9 window types** for different streaming scenarios:
 | **Session** | Gap-based | User sessions |
 | **ExternalTime** | Event time | Out-of-order events |
 | **Delay** | Time delay | Late arrivals |
+| **Unique** | Latest per unique key | Deduplication (keep latest) |
+| **FirstUnique** | First per unique key | Deduplication (keep first) |
+| **Expression** | Expression-based count | Dynamic count limits |
+| **Frequent** | Most frequent events | Top-N analysis |
+| **LossyFrequent** | Approximate frequency | High-volume frequency estimation |
 
 ### Pattern Matching
 

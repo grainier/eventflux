@@ -851,7 +851,6 @@ async fn session_window_test2_with_partition() {
 
 /// Unique window - keeps only one event per unique key
 #[tokio::test]
-#[ignore = "Unique window syntax not yet supported"]
 async fn unique_window_test1_basic() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT, volume INT);\n\
@@ -895,7 +894,6 @@ async fn unique_window_test1_basic() {
 
 /// First unique window - keeps first occurrence of each unique key
 #[tokio::test]
-#[ignore = "FirstUnique window syntax not yet supported"]
 async fn first_unique_window_test1_basic() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -929,7 +927,6 @@ async fn first_unique_window_test1_basic() {
 
 /// Delay window - delays events by specified time
 #[tokio::test]
-#[ignore = "Delay window syntax not yet supported"]
 async fn delay_window_test1_basic() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -1147,27 +1144,43 @@ async fn length_batch_window_test7_with_filter() {
 // Reference: query/window/ExpressionWindowTestCase.java
 // ============================================================================
 
-/// Expression window - dynamic window size based on expression
+/// Expression window - count-based expression limit
 #[tokio::test]
-#[ignore = "Expression window syntax not yet supported"]
 async fn expression_window_test1_basic() {
     let app = "\
-        CREATE STREAM stockStream (symbol STRING, price FLOAT, windowSize INT);\n\
+        CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
         CREATE STREAM outputStream (symbol STRING, total DOUBLE);\n\
         INSERT INTO outputStream\n\
         SELECT symbol, sum(price) AS total \
-        FROM stockStream WINDOW('expression', 'length', windowSize);\n";
-    let runner = AppRunner::new(app, "outputStream").await;
+        FROM stockStream WINDOW('expression', 'count() <= 2');\n";
+    let mut runner = AppRunner::new(app, "outputStream").await;
     runner.send(
         "stockStream",
         vec![
             AttributeValue::String("IBM".to_string()),
             AttributeValue::Float(100.0),
-            AttributeValue::Int(2),
+        ],
+    );
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(200.0),
+        ],
+    );
+    runner.send(
+        "stockStream",
+        vec![
+            AttributeValue::String("IBM".to_string()),
+            AttributeValue::Float(300.0),
         ],
     );
     let out = runner.shutdown();
     assert!(!out.is_empty());
+    // With count() <= 2, window holds at most 2 events.
+    // After 3 events: window contains events 2 and 3 (prices 200+300=500)
+    let last = &out[out.len() - 1];
+    assert_eq!(last[1], AttributeValue::Double(500.0));
 }
 
 // ============================================================================
@@ -1205,7 +1218,6 @@ async fn cron_window_test1_basic() {
 
 /// Frequent window - tracks most frequent values
 #[tokio::test]
-#[ignore = "Frequent window syntax not yet supported"]
 async fn frequent_window_test1_basic() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\
@@ -1245,7 +1257,7 @@ async fn frequent_window_test1_basic() {
 
 /// Lossless window - no event loss on overflow
 #[tokio::test]
-#[ignore = "Lossless window syntax not yet supported"]
+#[ignore = "Lossless window does not exist in Siddhi reference; test is invalid"]
 async fn lossless_window_test1_basic() {
     let app = "\
         CREATE STREAM stockStream (symbol STRING, price FLOAT);\n\

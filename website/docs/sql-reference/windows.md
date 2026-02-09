@@ -1,12 +1,12 @@
 ---
 sidebar_position: 2
 title: Windows
-description: Time-based and count-based window operations in EventFlux
+description: Time-based, count-based, key-based, and statistical window operations in EventFlux
 ---
 
 # Windows
 
-Windows are fundamental to stream processing, allowing you to group events for aggregation and analysis. EventFlux supports **9 window types** to cover different streaming scenarios.
+Windows are fundamental to stream processing, allowing you to group events for aggregation and analysis. EventFlux supports **14 window types** to cover different streaming scenarios.
 
 ## Window Syntax
 
@@ -33,6 +33,11 @@ INSERT INTO Output;
 | **Length** | Count | Last N events | Recent history |
 | **LengthBatch** | Count | N-event batches | Batch processing |
 | **Delay** | Time | Delayed emission | Late arrival handling |
+| **Unique** | Key | Latest per unique key | Deduplication (keep latest) |
+| **FirstUnique** | Key | First per unique key | Deduplication (keep first) |
+| **Expression** | Count | Expression-based size | Dynamic count limits |
+| **Frequent** | Statistical | Most frequent events | Top-N analysis |
+| **LossyFrequent** | Statistical | Approximate frequency | High-volume frequency estimation |
 
 ---
 
@@ -212,6 +217,86 @@ Batches:   Batch 1      Batch 2
           [─────]      [───────]
 ```
 
+### Expression Window
+
+A count-based sliding window whose size is defined by an expression string. Currently supports `count() <= N` and `count() < N`.
+
+```sql
+-- Keep at most 20 events in the window
+SELECT sensor_id,
+       AVG(temperature) AS avg_temp,
+       COUNT(*) AS reading_count
+FROM SensorReadings
+WINDOW('expression', 'count() <= 20')
+GROUP BY sensor_id
+INSERT INTO ExpressionStats;
+```
+
+**Parameters:**
+- Expression string: `'count() <= N'` or `'count() < N'`
+
+**Visual Representation:**
+```
+Events: 1 2 3 ... 19 20 21 22 ...
+Window:     [1..20]         (count() <= 20)
+               [2..21]
+                  [3..22]
+```
+
+---
+
+## Key-Based Windows
+
+### Unique Window
+
+Keeps only the **latest event** for each unique key value. When a new event arrives with the same key, it replaces the previous event (emitting the old one as expired).
+
+```sql
+-- Keep latest trade per symbol
+SELECT symbol, price, volume
+FROM StockTrades
+WINDOW('unique', symbol)
+INSERT INTO LatestTrades;
+```
+
+**Parameters:**
+- Attribute name to use as the unique key
+
+**Visual Representation:**
+```
+Events:  AAPL:150  GOOG:2800  AAPL:152  MSFT:300  AAPL:148
+Window:  {AAPL:148, GOOG:2800, MSFT:300}  (latest per key)
+```
+
+:::caution Memory
+The unique window grows with the number of distinct keys and is not bounded. Consider using with GROUP BY or filtered streams to limit cardinality.
+:::
+
+### FirstUnique Window
+
+Keeps only the **first event** for each unique key value. Subsequent events with the same key are silently discarded.
+
+```sql
+-- Keep first occurrence per user
+SELECT user_id, action, timestamp
+FROM UserActions
+WINDOW('firstUnique', user_id)
+INSERT INTO FirstActions;
+```
+
+**Parameters:**
+- Attribute name to use as the unique key
+
+**Visual Representation:**
+```
+Events:  user1:login  user2:click  user1:click  user3:login  user2:scroll
+Window:  {user1:login, user2:click, user3:login}  (first per key)
+```
+
+:::caution Memory
+Like the unique window, firstUnique grows with distinct keys and is not bounded.
+:::
+
 ---
 
 ## Special Windows
@@ -227,6 +312,74 @@ FROM SensorReadings
 WINDOW('delay', 30 SECONDS)
 INSERT INTO DelayedReadings;
 ```
+
+---
+
+## Statistical Windows
+
+### Frequent Window
+
+Tracks the **most frequently occurring events** using the Misra-Gries counting algorithm. Maintains a bounded set of the top-N most frequent items, evicting the least frequent when the set is full.
+
+```sql
+-- Track the 5 most frequently traded symbols
+SELECT symbol, price
+FROM StockTrades
+WINDOW('frequent', 5)
+INSERT INTO TopSymbols;
+```
+
+With specific key attributes:
+
+```sql
+-- Track top 5 by symbol, keyed on symbol attribute only
+SELECT symbol, COUNT(*) AS trade_count
+FROM StockTrades
+WINDOW('frequent', 5, symbol)
+GROUP BY symbol
+INSERT INTO FrequentSymbols;
+```
+
+**Parameters:**
+- First: Number of most frequent items to track (integer)
+- Optional: One or more attribute names for key generation (defaults to all attributes)
+
+### LossyFrequent Window
+
+Identifies events whose frequency **exceeds a support threshold** using the Lossy Counting algorithm. Suitable for high-volume streams where approximate frequency estimation is acceptable.
+
+```sql
+-- Find items appearing in more than 10% of events
+SELECT symbol, price
+FROM StockTrades
+WINDOW('lossyFrequent', 0.1)
+INSERT INTO FrequentItems;
+```
+
+With custom error bound:
+
+```sql
+-- Support threshold of 5%, error bound of 1%
+SELECT symbol, price
+FROM StockTrades
+WINDOW('lossyFrequent', 0.05, 0.01)
+INSERT INTO FrequentItems;
+```
+
+With key attributes:
+
+```sql
+-- Approximate frequency by symbol attribute
+SELECT symbol, price
+FROM StockTrades
+WINDOW('lossyFrequent', 0.1, 0.01, symbol)
+INSERT INTO FrequentItems;
+```
+
+**Parameters:**
+- First: Support threshold (float, 0.0–1.0) — minimum frequency ratio to emit
+- Optional second: Error bound (float, 0.0–1.0, defaults to support/10)
+- Optional remaining: Attribute names for key generation (defaults to all attributes)
 
 ---
 
@@ -275,6 +428,11 @@ INSERT INTO ActiveHighValueStocks;
 | Batch processing | LengthBatch or TimeBatch |
 | Out-of-order events | ExternalTime |
 | Late arrival handling | Delay |
+| Deduplication (keep latest) | Unique |
+| Deduplication (keep first) | FirstUnique |
+| Top-N frequency tracking | Frequent |
+| High-volume frequency estimation | LossyFrequent |
+| Dynamic count-based window | Expression |
 
 :::
 
@@ -282,6 +440,8 @@ INSERT INTO ActiveHighValueStocks;
 
 - **Large windows** consume more memory
 - **Session windows** can grow unbounded for active keys
+- **Unique/FirstUnique windows** grow with distinct key cardinality and are unbounded
+- **Frequent windows** are bounded by the configured count parameter
 - **Length windows** have predictable memory usage
 - Monitor memory usage in production
 
