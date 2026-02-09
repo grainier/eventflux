@@ -396,9 +396,11 @@ impl EventFluxContext {
             TimerSourceFactory,
         };
         use crate::core::query::processor::stream::window::{
-            CronWindowFactory, ExternalTimeBatchWindowFactory, ExternalTimeWindowFactory,
-            LengthBatchWindowFactory, LengthWindowFactory, LossyCountingWindowFactory,
-            SessionWindowFactory, SortWindowFactory, TimeBatchWindowFactory, TimeWindowFactory,
+            CronWindowFactory, DelayWindowFactory, ExpressionWindowFactory,
+            ExternalTimeBatchWindowFactory, ExternalTimeWindowFactory, FirstUniqueWindowFactory,
+            FrequentWindowFactory, LengthBatchWindowFactory, LengthWindowFactory,
+            LossyCountingWindowFactory, LossyFrequentWindowFactory, SessionWindowFactory,
+            SortWindowFactory, TimeBatchWindowFactory, TimeWindowFactory, UniqueWindowFactory,
         };
         use crate::core::query::selector::attribute::aggregator::{
             AvgAttributeAggregatorFactory, CountAttributeAggregatorFactory,
@@ -436,6 +438,12 @@ impl EventFluxContext {
         self.add_window_factory("cron".to_string(), Box::new(CronWindowFactory));
         self.add_window_factory("session".to_string(), Box::new(SessionWindowFactory));
         self.add_window_factory("sort".to_string(), Box::new(SortWindowFactory));
+        self.add_window_factory("unique".to_string(), Box::new(UniqueWindowFactory));
+        self.add_window_factory("firstUnique".to_string(), Box::new(FirstUniqueWindowFactory));
+        self.add_window_factory("delay".to_string(), Box::new(DelayWindowFactory));
+        self.add_window_factory("expression".to_string(), Box::new(ExpressionWindowFactory));
+        self.add_window_factory("frequent".to_string(), Box::new(FrequentWindowFactory));
+        self.add_window_factory("lossyFrequent".to_string(), Box::new(LossyFrequentWindowFactory));
 
         self.add_attribute_aggregator_factory(
             "sum".to_string(),
