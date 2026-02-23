@@ -22,7 +22,7 @@ This guide covers building, testing, running, and contributing to EventFlux.
 - Protocol Buffer Compiler (for gRPC features)
 
 MSRV is enforced via `Cargo.toml` (`package.rust-version`) and CI. If you don’t want to install Rust locally, use the
-official Docker image (`ghcr.io/eventflux-io/engine:latest`) for running `.eventflux` queries.
+official Docker image (`ghcr.io/eventflux-io/eventflux:latest`) for running `.eventflux` queries.
 
 ```bash
 # Install protoc (required for gRPC transport)
@@ -181,7 +181,7 @@ cargo bench
 ## Project Structure
 
 ```
-eventflux-engine/
+eventflux/
 ├── src/
 │   ├── core/                    # Runtime execution engine
 │   │   ├── ai/                  # AI/LLM integration (planned)

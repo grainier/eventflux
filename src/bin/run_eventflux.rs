@@ -18,7 +18,7 @@ use eventflux_rust::core::persistence::{
 };
 
 #[derive(Parser, Debug)]
-#[command(about = "Run a EventFluxQL file", author, version)]
+#[command(about = "Run an EventFluxQL file", author, version)]
 struct Cli {
     /// EventFluxQL file to execute
     eventflux_file: PathBuf,
