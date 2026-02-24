@@ -14,7 +14,7 @@ Add EventFlux to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-eventflux = { package = "eventflux_rust", git = "https://github.com/eventflux-io/eventflux.git" }
+eventflux = { git = "https://github.com/eventflux-io/eventflux.git" }
 ```
 
 Or install from source:

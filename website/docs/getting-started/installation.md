@@ -55,14 +55,14 @@ Add EventFlux to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-eventflux = { package = "eventflux_rust", git = "https://github.com/eventflux-io/eventflux.git" }
+eventflux = { git = "https://github.com/eventflux-io/eventflux.git" }
 ```
 
 Or with a specific revision:
 
 ```toml
 [dependencies]
-eventflux = { package = "eventflux_rust", git = "https://github.com/eventflux-io/eventflux.git", rev = "main" }
+eventflux = { git = "https://github.com/eventflux-io/eventflux.git", rev = "main" }
 ```
 
 ## Project Structure
@@ -85,7 +85,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eventflux = { package = "eventflux_rust", git = "https://github.com/eventflux-io/eventflux.git" }
+eventflux = { git = "https://github.com/eventflux-io/eventflux.git" }
 ```
 
 ## Verify Installation
